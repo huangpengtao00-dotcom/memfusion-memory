@@ -99,3 +99,12 @@ python3 test_memfusion.py   # 8 tests: wiki, explore, orchestration, API contrac
 - [x] Unit tests, README, requirements, start script
 - [ ] Train a stopping policy from collected traces (RL)
 - [ ] Multi-step navigation (restore explore browsing, not just keyword recall)
+
+## Docker (AML code submission)
+
+```bash
+docker build -t memfusion-v2 .
+docker run -p 8083:8083 -e MEMFUSION_LLM_API_KEY=your_key memfusion-v2
+```
+
+Endpoints: `POST /add`, `POST /search`, `GET /health`
