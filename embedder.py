@@ -62,6 +62,9 @@ class Embedder:
         m_norm = np.linalg.norm(mv, axis=1, keepdims=True)
         qn = qv[0] / q_norm if q_norm > 1e-9 else np.zeros_like(qv[0])
         mn = np.where(m_norm > 1e-9, mv / np.maximum(m_norm, 1e-9), np.zeros_like(mv))
+        # 除零/空向量会先产生 NaN 再被 nan_to_num 清理，提前补零避免 RuntimeWarning
+        qn = np.nan_to_num(qn)
+        mn = np.nan_to_num(mn)
         sims = (mn @ qn)
         # 清理 NaN/inf
         sims = np.nan_to_num(sims, nan=0.0, posinf=1.0, neginf=0.0)

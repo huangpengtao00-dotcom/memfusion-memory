@@ -62,7 +62,7 @@ def add(req: AddRequest):
             parsed.extend(store.parse_dialog(c))
         else:
             parsed.append(m)
-    store.ingest(req.user_id, parsed, writer=writer)
+    store.ingest(req.user_id, parsed, writer=writer, session_id=req.session_id)
     return {
         "success": True,
         "request_id": req.request_id,
@@ -103,7 +103,7 @@ def search(req: SearchRequest):
     """explore agent 在 wiki 里探索，返回相关证据。只返回证据不生成答案。
     证据 content 带元数据头（source/date），让 answer 模型更容易正确引用。
     用同步 def（FastAPI 自动线程池），避免 async + 阻塞阻塞事件循环。"""
-    results = explorer.explore(req.user_id, req.query)
+    results = explorer.explore(req.user_id, req.query, top_k=req.top_k)
     # 限制 top_k
     data = [{
         "id": r.get("id", ""),

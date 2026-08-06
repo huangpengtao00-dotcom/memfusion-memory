@@ -145,11 +145,13 @@ class WikiStore:
         return page.to_dict() if page else None
 
     # ---- 写入：消息 → wiki ----
-    def ingest(self, user_id: str, messages: List[Dict], writer=None) -> int:
+    def ingest(self, user_id: str, messages: List[Dict], writer=None,
+               session_id: Optional[str] = None) -> int:
         """
         把一批消息写入 wiki。
         writer 提供时：LLM 抽事实 → 按 topic 建页/更新 → 按 dimension 归维度。
         writer 为 None 时：降级为简单匹配（每条消息建/更新一页）。
+        session_id：无 source 的消息用它兜底分组（_expand_neighbors 依赖）。
 
         建链接逻辑：
         - 同一批消息抽出的 facts，如果 topic 不同但有重叠实体 → related_to
@@ -157,9 +159,10 @@ class WikiStore:
         """
         # 整批写入加锁：并发 Add 时保证原子性
         with self._lock:
-            return self._ingest_unlocked(user_id, messages, writer)
+            return self._ingest_unlocked(user_id, messages, writer, session_id)
 
-    def _ingest_unlocked(self, user_id: str, messages: List[Dict], writer=None) -> int:
+    def _ingest_unlocked(self, user_id: str, messages: List[Dict], writer=None,
+                         session_id: Optional[str] = None) -> int:
         """加锁内的实际写入逻辑。"""
         dims = self._ensure_user(user_id)
         written = 0
@@ -189,6 +192,10 @@ class WikiStore:
             content = msg.get("content", "")
             if not content:
                 continue
+
+            # source 兜底：_expand_neighbors 按 source 分组判相邻，空 source 会全失效
+            if not msg.get("source"):
+                msg["source"] = session_id or f"{user_id}:batch"
 
             # 相对时间归一化（用会话日期当锚点，不用 today()）
             try:
@@ -260,6 +267,7 @@ class WikiStore:
                         # 否定是极性标记，不影响置信度
                         polarity="negative" if is_negation else "positive",
                         confidence=0.8,
+                        source=msg.get("source", ""),  # 证据溯源（窗口扩展分组键）
                         order=msg_idx,  # 消息序号（滑动窗口用）
                     ))
                     pages_this_batch.append(page)
@@ -466,6 +474,15 @@ class WikiStore:
             session_date = extract_session_date(memory)
         except Exception:
             pass
+        # 会话标识：从头部提取 Session YYYY/MM/DD 片段作为同源分组键
+        # （_expand_neighbors 按 source 分组判相邻，无 source 时窗口扩展完全失效）
+        source = "dialog"
+        try:
+            m = re.search(r"History Chats:\s*(Session[^:]*:?)", memory)
+            if m:
+                source = m.group(1).strip(" :")
+        except Exception:
+            pass
 
         msgs = []
         pattern = r"\{'role':\s*'(\w+)',\s*'content':\s*'((?:[^'\\]|\\.)*)'\}"
@@ -474,12 +491,14 @@ class WikiStore:
             content = content.replace("\\n", "\n").replace("\\'", "'")
             if content.strip():
                 msgs.append({"role": role, "content": content,
-                             "session_date": session_date})
+                             "session_date": session_date,
+                             "source": source})
             if len(msgs) >= max_msgs:
                 break
         if not msgs:
             msgs = [{"role": "user", "content": memory,
-                     "session_date": session_date}]
+                     "session_date": session_date,
+                     "source": source}]
         return msgs
 
     @staticmethod

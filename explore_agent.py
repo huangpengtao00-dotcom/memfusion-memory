@@ -251,9 +251,10 @@ class ExploreAgent:
         return "DONE"
 
     # ---- 主入口 ----
-    def explore(self, user_id: str, query: str) -> List[Dict]:
+    def explore(self, user_id: str, query: str, top_k: Optional[int] = None) -> List[Dict]:
         """
         在 wiki 里探索，返回相关证据（只返回证据，不生成答案）。
+        top_k：召回宽度（默认 None→题型感知）。评测平台传 100 时填满到 top_k。
         """
         tools = self._tools(user_id)
         state: Dict = {}
@@ -278,8 +279,9 @@ class ExploreAgent:
         try:
             seed_q = expanded if (expanded and expanded != query) else query
             # 题型感知召回宽度：count/time 更宽防漏（Fable5）
+            # top_k 传入时以 top_k 为准（评测平台要填满到 top_k，不只 10/15）
             qtype = self.detect_query_type(query)
-            recall_k = self._recall_k(qtype)
+            recall_k = max(self._recall_k(qtype), top_k or 0)
             seed = tools["keyword_search"](seed_q, recall_k)
             if not seed and expanded != query:
                 seed = tools["keyword_search"](query, recall_k)  # 扩展没召回 → 原 query
@@ -315,37 +317,12 @@ class ExploreAgent:
                 "has_evidence": bool(state.get("evidence")),
             }
             # 无论有无证据都返回（有证据返回结果，没证据返回空）——不做多步导航，保评测快
+            # 多步 ReAct 循环已删除（Fable5 B：原 323-350 行 for 循环在 318 行 return 后
+            # 永远不可达 = 死代码；单步 + _expand_neighbors 确定性链接展开已覆盖其意图）
             return self._dedup(state.get("evidence", []))
         except Exception:
             self.last_diag = {"error": True}
             return self._dedup(state.get("evidence", []))
-
-        for _ in range(self.max_steps):
-            # 决策：LLM decider 优先，失败/超时降级启发式
-            if self.decider:
-                try:
-                    action = self.decider.decide(query, state, tools)
-                    self._exec_action(action, state, tools, user_id)
-                except Exception:
-                    action = self._heuristic_step(query, state, tools)
-            else:
-                action = self._heuristic_step(query, state, tools)
-
-            # 收集 evidence
-            if "evidence" in state and state["evidence"]:
-                evidence = state["evidence"]
-
-            if action == "DONE":
-                break
-
-        # 去重 + 排序
-        seen = set()
-        out = []
-        for e in evidence:
-            if e["id"] not in seen and e["content"] != "" and not e["content"].startswith("[link:"):
-                seen.add(e["id"])
-                out.append(e)
-        return out
 
     @staticmethod
     def detect_query_type(query: str) -> str:
