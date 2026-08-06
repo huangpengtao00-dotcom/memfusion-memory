@@ -18,6 +18,7 @@ class Embedder:
         self.model_name = model_name
         self._model = None
         self._dims = 0
+        self._cache: Dict[str, list] = {}  # text -> embedding（缓存，评测同 query/记忆复用）
 
     def _ensure_model(self):
         if self._model is None:
@@ -31,11 +32,17 @@ class Embedder:
         return self._model is not None
 
     def embed(self, texts: List[str]) -> Optional[np.ndarray]:
-        """批量 embed。失败返回 None（降级到词频）。"""
+        """批量 embed（带缓存）。失败返回 None（降级到词频）。"""
         if not self._ensure_model():
             return None
         try:
-            return np.array(list(self._model.embed(texts)))
+            # 缓存命中（评测同 query/记忆重复调用多）
+            uncached = [t for t in texts if t not in self._cache]
+            if uncached:
+                embs = list(self._model.embed(uncached))
+                for t, e in zip(uncached, embs):
+                    self._cache[t] = e
+            return np.array([self._cache[t] for t in texts])
         except Exception:
             return None
 

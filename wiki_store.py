@@ -32,6 +32,7 @@ class Section:
     confidence: float = 1.0            # 抽取置信度（≠极性，≠状态）
     polarity: str = "positive"         # positive / negative（Fable5：否定≠低置信）
     source: str = ""                   # 来源（对话/消息 id，可审计）
+    order: int = 0                     # 对话内消息序号（滑动窗口用）
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -164,15 +165,35 @@ class WikiStore:
         written = 0
         pages_this_batch: List[Page] = []
 
-        for msg in messages:
+        # 提取会话日期作为相对时间归一化锚点（bug 修复：不用 today()）
+        # 优先取 parse_dialog 附到消息上的 session_date（真实 LongMemEval 日期在
+        # full_input 头部，不在消息 content 里）；构造消息没有则回落到内容扫描。
+        session_date = None
+        try:
+            for msg in messages:
+                sd = msg.get("session_date")
+                if sd:
+                    session_date = sd
+                    break
+            if session_date is None:
+                from time_utils import extract_session_date
+                for msg in messages:
+                    sd = extract_session_date(msg.get("content", ""))
+                    if sd:
+                        session_date = sd
+                        break
+        except Exception:
+            pass
+
+        for msg_idx, msg in enumerate(messages):
             content = msg.get("content", "")
             if not content:
                 continue
 
-            # 相对时间归一化（Fable5：locomo 时间推理关键）
+            # 相对时间归一化（用会话日期当锚点，不用 today()）
             try:
                 from time_utils import normalize_relative_times
-                content = normalize_relative_times(content)
+                content = normalize_relative_times(content, ref_date=session_date)
             except Exception:
                 pass
 
@@ -223,6 +244,7 @@ class WikiStore:
                             polarity="negative" if is_negation else "positive",
                             confidence=0.85,
                             source=msg.get("source", ""),  # 证据溯源
+                            order=msg_idx,                  # 消息序号
                         ))
             else:
                 # 降级：简单建页
@@ -238,6 +260,7 @@ class WikiStore:
                         # 否定是极性标记，不影响置信度
                         polarity="negative" if is_negation else "positive",
                         confidence=0.8,
+                        order=msg_idx,  # 消息序号（滑动窗口用）
                     ))
                     pages_this_batch.append(page)
             written += 1
@@ -304,6 +327,7 @@ class WikiStore:
                         "temporal": section.temporal,   # 时间锚点
                         "confidence": section.confidence,  # 抽取置信度
                         "polarity": section.polarity,   # 极性（Fable5：否定≠低置信）
+                        "order": section.order,         # 消息序号（滑动窗口用）
                         "speaker": section.facts[0] if section.facts else "",  # speaker 占位
                     }
 
@@ -334,7 +358,89 @@ class WikiStore:
         results = [mem_map[c] for c in sorted_content[:top_k]]
         # 只保留"至少被词频或语义命中"的（RRF>0）
         results = [r for r in results if rrf.get(r["content"], 0) > 0]
-        return results
+        # 滑动窗口扩展：命中消息的相邻消息也补召回（对话连续性，locomo/scriptmem 事件簇）
+        results = self._expand_neighbors(user_id, results, window=2, max_extra=10)
+        # 注意：近重复去重(_dedup_similar) 未验证出提升，暂不启用（避免未验证改动）
+        return results[:top_k]
+
+    def _expand_neighbors(self, user_id: str, results: List[Dict],
+                          window: int = 2, max_extra: int = 10) -> List[Dict]:
+        """
+        滑动窗口扩展：对已命中消息，补召回同 source 对话里相邻 window 条消息。
+        解决"答案依赖上下文连续消息"（locomo 事件簇 / scriptmem 场景）。
+        """
+        if not results:
+            return results
+        # 构建 (source, order) -> section 索引（按对话分组）
+        from collections import defaultdict
+        by_source = defaultdict(list)  # source -> [(order, content, page_id)]
+        dims = self._ensure_user(user_id)
+        for dim in dims.values():
+            for page in dim.pages.values():
+                for section in page.sections.values():
+                    if section.source:
+                        by_source[section.source].append(
+                            (section.order, section.content, page.id, section.source))
+
+        # 对每个 source 按 order 排序
+        for src in by_source:
+            by_source[src].sort()
+
+        # 收集命中消息的 source+order，补相邻
+        hit_keys = set()
+        for r in results:
+            if r.get("source"):
+                hit_keys.add((r["source"], r.get("order", 0)))
+
+        extra = []
+        seen = {r["content"] for r in results}
+        for src, orders in by_source.items():
+            orders_list = sorted(orders)
+            for (order, content, page_id, source) in orders_list:
+                if (src, order) in hit_keys:
+                    # 命中 → 补相邻
+                    continue
+                # 检查这条是否在某个命中消息的 window 内
+                for (h_src, h_order) in hit_keys:
+                    if h_src == src and abs(order - h_order) <= window:
+                        if content not in seen and len(extra) < max_extra:
+                            extra.append({
+                                "id": page_id, "content": content, "score": 0.3,
+                                "source": source, "order": order,
+                                "page_title": "", "dimension": "",
+                            })
+                            seen.add(content)
+                        break
+        return results + extra
+
+    @staticmethod
+    def _dedup_similar(results: List[Dict], sim_thresh: float = 0.7) -> List[Dict]:
+        """
+        近重复证据去重（Fable5：count 题防同一事件重复占位）。
+        按 token 重叠度合并高度相似的证据，保留分数最高的一条。
+        这样 top-k 能容纳更多独立事件（doctors/festivals 计数）。
+        """
+        if not results:
+            return results
+        deduped = []
+        for r in sorted(results, key=lambda x: -x.get("score", 0)):
+            r_tokens = set(WikiStore._tokenize(r["content"]))
+            if not r_tokens:
+                deduped.append(r)
+                continue
+            is_dup = False
+            for d in deduped:
+                d_tokens = set(WikiStore._tokenize(d["content"]))
+                if not d_tokens:
+                    continue
+                inter = len(r_tokens & d_tokens)
+                sim = inter / min(len(r_tokens), len(d_tokens))  # 最小覆盖率
+                if sim >= sim_thresh:
+                    is_dup = True
+                    break
+            if not is_dup:
+                deduped.append(r)
+        return deduped
 
     @staticmethod
     def _is_negation(text: str) -> bool:
@@ -352,17 +458,28 @@ class WikiStore:
         按消息建记忆（比按 chunk 更能精确召回答案所在的消息）。
         """
         import re
+        # 会话日期在 full_input 头部（"History Chats:Session 2023/02/15 ..."），
+        # 不在消息 content 里——先提取，后面附到每条消息上，ingest 才能用对锚点
+        session_date = None
+        try:
+            from time_utils import extract_session_date
+            session_date = extract_session_date(memory)
+        except Exception:
+            pass
+
         msgs = []
         pattern = r"\{'role':\s*'(\w+)',\s*'content':\s*'((?:[^'\\]|\\.)*)'\}"
         for m in re.finditer(pattern, memory):
             role, content = m.group(1), m.group(2)
             content = content.replace("\\n", "\n").replace("\\'", "'")
             if content.strip():
-                msgs.append({"role": role, "content": content})
+                msgs.append({"role": role, "content": content,
+                             "session_date": session_date})
             if len(msgs) >= max_msgs:
                 break
         if not msgs:
-            msgs = [{"role": "user", "content": memory}]
+            msgs = [{"role": "user", "content": memory,
+                     "session_date": session_date}]
         return msgs
 
     @staticmethod
