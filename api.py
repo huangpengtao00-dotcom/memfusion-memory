@@ -13,8 +13,9 @@ from explore_agent import ExploreAgent, LLMDecider
 from llm_writer import LLMWriter
 from orchestration import make_orchestrator
 from llm_config import LLM_BASE_URL, LLM_API_KEY, FAST_MODEL
+from entity_extractor import build_count_hint
 
-app = FastAPI(title="MemFusion v2", version="2.1.0")
+app = FastAPI(title="MemFusion v2", version="2.2.0")
 
 store: WikiStore = get_store()
 decider = LLMDecider(api_key=LLM_API_KEY, base_url=LLM_BASE_URL + "/chat/completions", model=FAST_MODEL)
@@ -104,6 +105,14 @@ def search(req: SearchRequest):
     证据 content 带元数据头（source/date），让 answer 模型更容易正确引用。
     用同步 def（FastAPI 自动线程池），避免 async + 阻塞阻塞事件循环。"""
     results = explorer.explore(req.user_id, req.query, top_k=req.top_k)
+    # count 类 query：LLM 实体聚簇提示（让 answer 模型能数对），失败降级词法
+    try:
+        results = build_count_hint(
+            req.query, results,
+            api_key=LLM_API_KEY, model=FAST_MODEL, base_url=LLM_BASE_URL + "/chat/completions",
+        )
+    except Exception:
+        pass
     # 限制 top_k
     data = [{
         "id": r.get("id", ""),
@@ -115,7 +124,7 @@ def search(req: SearchRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "wiki_version": "v2.1.0", "users": len(store.users)}
+    return {"status": "ok", "wiki_version": "v2.2.0", "users": len(store.users)}
 
 
 if __name__ == "__main__":

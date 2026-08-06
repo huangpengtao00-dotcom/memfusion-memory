@@ -368,8 +368,57 @@ class WikiStore:
         results = [r for r in results if rrf.get(r["content"], 0) > 0]
         # 滑动窗口扩展：命中消息的相邻消息也补召回（对话连续性，locomo/scriptmem 事件簇）
         results = self._expand_neighbors(user_id, results, window=2, max_extra=10)
+        # count 聚簇提示由 api.py 的 LLM 实体提取(build_count_hint)负责，这里不重复
         # 注意：近重复去重(_dedup_similar) 未验证出提升，暂不启用（避免未验证改动）
         return results[:top_k]
+
+    @staticmethod
+    def _cluster_count_hint(query: str, results: List[Dict],
+                            top_k: int = 100) -> List[Dict]:
+        """
+        count 类题目聚簇提示：统计召回消息里高频出现的"主题实体"（词或短语），
+        对每个高频主题标注"提到 N 次"（N=包含该实体的不同消息数）。
+        追加为一条结构化证据，让 answer 模型能数出 count 题答案。
+        仅当 query 是 count 类（how many / how much / count）才触发。
+        词法近似：不保证语义完全正确，但给 answer 一个可数的线索。
+        """
+        # 只在 count 类 query 触发（避免普通题被聚簇噪音干扰）
+        if not any(w in query.lower() for w in ["how many", "how much", "count", "number of", "几", "多少", "几个"]):
+            return results
+
+        # 统计召回内容里出现的高频词（长度>3 的英文词），排除 stopword
+        from collections import Counter
+        import re
+        stop = {"that", "this", "with", "have", "from", "they", "there", "what",
+                "when", "your", "about", "some", "these", "those", "them", "been",
+                "were", "will", "would", "could", "should", "because", "then", "than",
+                "really", "very", "just", "make", "made", "think", "need", "going",
+                "want", "like", "know", "one", "well", "even", "still", "also", "back"}
+        counter = Counter()
+        for r in results:
+            content = r.get("content", "")
+            words = [w for w in re.findall(r"[a-z]{4,}", content.lower()) if w not in stop]
+            counter.update(set(words))  # 每条消息内去重，跨消息计数
+
+        # 高频主题实体（出现在 >=2 条不同消息）
+        themes = [w for w, c in counter.items() if c >= 2]
+        themes = themes[:5]  # 最多 5 个主题
+
+        if not themes:
+            return results
+
+        # 每个主题：统计包含它的不同消息数
+        hint_parts = []
+        for theme in themes:
+            msg_count = sum(1 for r in results if re.search(rf"\b{re.escape(theme)}\b",
+                                                            r.get("content", "").lower()))
+            hint_parts.append(f"{theme}:{msg_count}")
+        hint = "[count-hint] " + ", ".join(hint_parts)
+        results = results + [{
+            "id": "count-hint", "content": hint, "score": 0.5,
+            "page_title": "", "dimension": "", "source": "", "order": -1,
+        }]
+        return results
 
     def _expand_neighbors(self, user_id: str, results: List[Dict],
                           window: int = 2, max_extra: int = 10) -> List[Dict]:
@@ -485,10 +534,12 @@ class WikiStore:
             pass
 
         msgs = []
-        pattern = r"\{'role':\s*'(\w+)',\s*'content':\s*'((?:[^'\\]|\\.)*)'\}"
+        # content 实际用双引号包裹（如 "I'm making progress..."），单引号正则会漏解析。
+        # 兼容双引号 content；role 用单引号。
+        pattern = r"\{'role':\s*'(\w+)',\s*'content':\s*\"((?:[^\"\\]|\\.)*)\"\}"
         for m in re.finditer(pattern, memory):
             role, content = m.group(1), m.group(2)
-            content = content.replace("\\n", "\n").replace("\\'", "'")
+            content = content.replace("\\n", "\n").replace("\\'", "'").replace('\\"', '"')
             if content.strip():
                 msgs.append({"role": role, "content": content,
                              "session_date": session_date,
