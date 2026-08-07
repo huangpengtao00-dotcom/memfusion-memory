@@ -141,11 +141,9 @@ def build_sum_hint(query: str, results: List[Dict]) -> Optional[str]:
     distinct = sorted(set(pairs))
     if len(distinct) < 2:
         return None
-    total = sum(n for n, _ in distinct)
     parts = " + ".join(str(n) for n, _ in distinct)
-    unit = unit_word + ("s" if total != 1 else "")
-    return (f"[sum-hint] The user reported these {unit_word} amounts: {parts}. "
-            f"Total = {total} {unit}. So the answer is {total} {unit}.")
+    # 合规：只列用户报告的数值(证据)，不求和、不给答案。answer 模型自己加。
+    return (f"[sum-hint] The user reported these {unit_word} amounts: {parts}.")
 
 
 # ---- 机制3(TReMu)：钟表时间跨消息推断 ----

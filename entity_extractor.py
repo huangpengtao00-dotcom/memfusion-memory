@@ -280,9 +280,9 @@ def build_count_hint(query: str, results: List[Dict],
     if not merged:
         return results
 
-    # v2.7b：显式给出 count（answer 模型数数不可靠：festivals 列 5 个实体数成 3、
-    # instruments 列 5 个数成 5）。count 由实体列表长度决定，answer 只须照抄。
-    hint = f"[count-hint] count={len(merged)}, entities: " + ", ".join(merged)
+    # 合规(比赛"不得在 Search 中直接生成最终答案")：只列实体，不写 count=N。
+    # count 由实体列表长度决定，answer 模型自己数（合规审查确认：列实体=证据，写总数=违规）。
+    hint = f"[count-hint] entities: " + ", ".join(merged)
     # v2.7：插入到最前（原来 append 在尾部）。full_input(500条)下结果往往 >10 条，
     # eval/上游只取 results[:10]，append 的 count-hint 被截断丢给 answer 模型 → count 题
     # 系统性失败（focused 3条时 results<10 侥幸可见，full 500条必丢）。前置保证 count-hint 一定送达。

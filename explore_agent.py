@@ -445,9 +445,7 @@ class ExploreAgent:
                     u_age = int(mu.group(1))
         if x_age is None or u_age is None or u_age < x_age:
             return None
-        diff = u_age - x_age
-        return (f"[age-hint] {xname} is {x_age} years old, and the user is {u_age}. "
-                f"So the user was {diff} years old when {xname} was born.")
+        return (f"[age-hint] {xname} is {x_age} years old, and the user is {u_age}.")
 
     @staticmethod
     def _has_temporal_intent(query: str) -> bool:
