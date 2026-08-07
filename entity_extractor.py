@@ -25,6 +25,9 @@ log = logging.getLogger("memfusion.entity")
 # 默认走环境变量 LLM（比赛合规 gpt-4o-mini；端点无则用 gpt-5.4-mini）
 DEFAULT_URL = "https://mx.free.codesonline.dev/v1/chat/completions"
 
+# LLM 提取结果缓存（query+内容 → entities），比赛重复 Search 同 query 时省 LLM 调用
+_EXTRACT_CACHE: Dict[str, Optional[List[str]]] = {}
+
 EXTRACT_PROMPT = """你是记忆助手。根据问题,从下面的对话消息里提取与答案相关的**具体实体**列表。
 
 问题: {question}
@@ -67,11 +70,15 @@ def extract_entities(query: str, contents: List[str],
                      api_key: str = "", model: str = "gpt-5.4-mini",
                      base_url: str = DEFAULT_URL,
                      timeout: int = 25) -> Optional[List[str]]:
-    """LLM 提取实体。无 key 或失败返回 None（调用方降级词法）。"""
+    """LLM 提取实体。无 key 或失败返回 None（调用方降级词法）。
+    带缓存：相同 query+召回内容 不重复调 LLM（比赛会重复 Search 同 query，省超时/成本）。"""
     if not api_key or not contents:
         return None
     msgs_text = "\n".join("· " + c[:150] for c in contents[:15])
     prompt = EXTRACT_PROMPT.format(question=query, messages=msgs_text)
+    cache_key = prompt[:800]
+    if cache_key in _EXTRACT_CACHE:
+        return _EXTRACT_CACHE[cache_key]
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -93,7 +100,9 @@ def extract_entities(query: str, contents: List[str],
         ents = json.loads(m.group(0)).get("entities", [])
     except Exception:
         return None
-    return [str(e).strip() for e in ents if str(e).strip()]
+    ents = [str(e).strip() for e in ents if str(e).strip()]
+    _EXTRACT_CACHE[cache_key] = ents
+    return ents
 
 
 def build_count_hint(query: str, results: List[Dict],

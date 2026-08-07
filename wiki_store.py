@@ -515,12 +515,23 @@ class WikiStore:
         按消息建记忆（比按 chunk 更能精确召回答案所在的消息）。
         """
         import re
+        import datetime as _dt
         # 会话日期在 full_input 头部（"History Chats:Session 2023/02/15 ..."），
         # 不在消息 content 里——先提取，后面附到每条消息上，ingest 才能用对锚点
         session_date = None
         try:
             from time_utils import extract_session_date
             session_date = extract_session_date(memory)
+        except Exception:
+            pass
+        # 会话时间锚点：用会话日期生成 epoch（UTC 午夜），写进消息 timestamp，
+        # 让 section.temporal 有值 → 证据带 [date:] 头（时序题必需）
+        timestamp = None
+        try:
+            if session_date is not None:
+                ts_epoch = _dt.datetime(session_date.year, session_date.month,
+                                        session_date.day, tzinfo=_dt.timezone.utc)
+                timestamp = int(ts_epoch.timestamp() * 1000)
         except Exception:
             pass
         # 会话标识：从头部提取 Session YYYY/MM/DD 片段作为同源分组键
@@ -534,21 +545,24 @@ class WikiStore:
             pass
 
         msgs = []
-        # content 实际用双引号包裹（如 "I'm making progress..."），单引号正则会漏解析。
-        # 兼容双引号 content；role 用单引号。
-        pattern = r"\{'role':\s*'(\w+)',\s*'content':\s*\"((?:[^\"\\]|\\.)*)\"\}"
+        # content 用双引号或单引号包裹（如 "I'm making progress..." / 'content'）。
+        # 兼容两种引号，避免单引号 content 丢消息。
+        pattern = (r"\{'role':\s*'(\w+)',\s*'content':\s*"
+                   r"(?:\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)')}")
         for m in re.finditer(pattern, memory):
-            role, content = m.group(1), m.group(2)
+            role, content = m.group(1), m.group(2) if m.group(2) is not None else m.group(3)
             content = content.replace("\\n", "\n").replace("\\'", "'").replace('\\"', '"')
             if content.strip():
                 msgs.append({"role": role, "content": content,
                              "session_date": session_date,
+                             "timestamp": timestamp,
                              "source": source})
             if len(msgs) >= max_msgs:
                 break
         if not msgs:
             msgs = [{"role": "user", "content": memory,
                      "session_date": session_date,
+                     "timestamp": timestamp,
                      "source": source}]
         return msgs
 
