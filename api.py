@@ -15,7 +15,7 @@ from orchestration import make_orchestrator
 from llm_config import LLM_BASE_URL, LLM_API_KEY, FAST_MODEL
 from entity_extractor import build_count_hint
 
-app = FastAPI(title="MemFusion v2", version="2.6.1")
+app = FastAPI(title="MemFusion v2", version="2.7.0")
 
 store: WikiStore = get_store()
 decider = LLMDecider(api_key=LLM_API_KEY, base_url=LLM_BASE_URL + "/chat/completions", model=FAST_MODEL)
@@ -129,7 +129,7 @@ def search(req: SearchRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "wiki_version": "v2.6.1", "users": len(store.users)}
+    return {"status": "ok", "wiki_version": "v2.7.0", "users": len(store.users)}
 
 
 if __name__ == "__main__":
