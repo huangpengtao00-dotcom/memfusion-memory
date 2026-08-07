@@ -42,6 +42,9 @@ entities 规则:
 - **列出每一个**不同的实体,拿不准也列,宁多勿漏(count 题靠它数数)
 - 去重(同一实体只列一次)
 - 只列与问题答案相关的
+- **若问题是"当前拥有/目前有/currently"类:只列"当前有效"的实体**,
+  排除历史已卖的、想买的(愿望)、别人/助手推荐的(非用户所有)、过去的
+  示例:问"currently own 乐器",只列当前拥有的乐器,不列"想买"/"卖掉了"的
 """
 
 # 词法降级：提取 Dr.X / 数字+单位 类模式
@@ -117,7 +120,12 @@ def build_count_hint(query: str, results: List[Dict],
     """
     if not is_count_query(query) or not results:
         return results
-    contents = [r.get("content", "") for r in results if r.get("content")]
+    # 优先用户自述(user)，assistant 推荐是噪音(ukulele 想买但没买混入)。
+    # user 排前，assistant 后置——extract_entities 喂 contents[:40] 时先丢 assistant。
+    user_contents = [r.get("content", "") for r in results
+                     if r.get("content") and r.get("role") != "assistant"]
+    all_contents = [r.get("content", "") for r in results if r.get("content")]
+    contents = user_contents + all_contents
     if not contents:
         return results
 

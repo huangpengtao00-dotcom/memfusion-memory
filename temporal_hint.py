@@ -81,17 +81,13 @@ def build_temporal_hint(query: str, results: List[Dict],
         else:
             val, unit = delta, "days"
         return (f"[time-hint] The current date (today) is {asof}. "
-                f"The relevant event happened on {ev}, which is {val} {unit} before today. "
-                f"So the answer is {val}.")
+                f"The relevant event happened on {ev}.")
 
     if is_between:
         if len(dates) < 2:
             return None
         d0, d1 = dates[0], dates[-1]
-        delta = (d1 - d0).days
-        return (f"[time-hint] The two relevant event dates are {d0} and {d1}. "
-                f"The number of days between them is {delta}. "
-                f"So the answer is {delta} days.")
+        return (f"[time-hint] The two relevant event dates are {d0} and {d1}.")
 
     return None
 
@@ -147,7 +143,5 @@ def build_clock_hint(query: str, results: List[Dict]) -> Optional[str]:
     n = _to_num(dur.group(1))
     if n is None:
         return None
-    h24 = _to_24h(int(dep.group(1)), dep.group(2))
-    arrive = _to_12h(h24 + n)
-    return (f"[time-hint] {dep.group(1)} {dep.group(2).upper()} + {n} hours "
-            f"= {arrive}. So the answer is {arrive}.")
+    return (f"[time-hint] departure was at {dep.group(1)} {dep.group(2).upper()}, "
+            f"and the trip took {n} hours.")

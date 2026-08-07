@@ -292,6 +292,7 @@ class ExploreAgent:
                      "page_title": r.get("page_title", ""),
                      "dimension": r.get("dimension", ""),
                      "source": r.get("source", ""),      # 证据溯源透传
+                     "role": r.get("role", ""),          # user/assistant(count-hint 过滤用)
                      "temporal": r.get("temporal"),      # 时间锚点透传
                      "confidence": r.get("confidence", 1.0),  # 置信度透传
                      "polarity": r.get("polarity", "positive")}  # 极性透传
