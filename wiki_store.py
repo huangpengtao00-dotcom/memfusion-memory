@@ -88,8 +88,17 @@ class WikiStore:
     def __init__(self):
         # user_id -> {dim_id -> Dimension}
         self.users: Dict[str, Dict[str, Dimension]] = {}
+        # user_id -> 用户级元数据（如 Current Date，时序题 "X days ago" 参考锚点）
+        self.user_meta: Dict[str, Dict] = {}
         # 线程锁：FastAPI 多线程并发 Add/Search，写操作需要保护
         self._lock = __import__("threading").RLock()
+
+    def set_user_meta(self, user_id: str, key: str, value) -> None:
+        with self._lock:
+            self.user_meta.setdefault(user_id, {})[key] = value
+
+    def get_user_meta(self, user_id: str, key: str, default=None):
+        return self.user_meta.get(user_id, {}).get(key, default)
 
     # ---- user 管理 ----
     def _ensure_user(self, user_id: str) -> Dict[str, Dimension]:
@@ -185,6 +194,19 @@ class WikiStore:
                     if sd:
                         session_date = sd
                         break
+        except Exception:
+            pass
+
+        # 提取 "Current Date"（时序题 "X days ago" 参考锚点，Super Bowl 题证明是命门）
+        try:
+            from time_utils import extract_current_date
+            cur = None
+            for msg in messages:
+                cur = extract_current_date(msg.get("content", ""))
+                if cur:
+                    break
+            if cur is not None:
+                self.set_user_meta(user_id, "current_date", str(cur))
         except Exception:
             pass
 

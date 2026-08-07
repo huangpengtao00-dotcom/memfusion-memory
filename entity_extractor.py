@@ -39,6 +39,7 @@ EXTRACT_PROMPT = """你是记忆助手。根据问题,从下面的对话消息�
 
 entities 规则:
 - 是**具体事物**(衣物名、医生名、水果名、活动名等),不是抽象词
+- **列出每一个**不同的实体,拿不准也列,宁多勿漏(count 题靠它数数)
 - 去重(同一实体只列一次)
 - 只列与问题答案相关的
 """
@@ -74,7 +75,9 @@ def extract_entities(query: str, contents: List[str],
     带缓存：相同 query+召回内容 不重复调 LLM（比赛会重复 Search 同 query，省超时/成本）。"""
     if not api_key or not contents:
         return None
-    msgs_text = "\n".join("· " + c[:150] for c in contents[:15])
+    # 喂全部召回消息（不全量截断——维度侧报告实证：contents[:15]+c[:150] 会丢第三个实体
+    # → count 题系统性少数 1）。全部召回通常 ≤30 条，每条取 300 字符，控制上下文。
+    msgs_text = "\n".join("· " + c[:300] for c in contents[:40])
     prompt = EXTRACT_PROMPT.format(question=query, messages=msgs_text)
     cache_key = prompt[:800]
     if cache_key in _EXTRACT_CACHE:

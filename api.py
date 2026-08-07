@@ -15,7 +15,7 @@ from orchestration import make_orchestrator
 from llm_config import LLM_BASE_URL, LLM_API_KEY, FAST_MODEL
 from entity_extractor import build_count_hint
 
-app = FastAPI(title="MemFusion v2", version="2.3.0")
+app = FastAPI(title="MemFusion v2", version="2.4.0")
 
 store: WikiStore = get_store()
 decider = LLMDecider(api_key=LLM_API_KEY, base_url=LLM_BASE_URL + "/chat/completions", model=FAST_MODEL)
@@ -113,6 +113,14 @@ def search(req: SearchRequest):
         )
     except Exception:
         pass
+    # 上送 Current Date（时序题 "X days ago" 参考锚点，否则 answer 无法推算相对现在时间）
+    asof = store.get_user_meta(req.user_id, "current_date")
+    if asof:
+        results = results + [{
+            "id": "as-of", "content": f"[as-of: {asof}]",
+            "score": 0.4, "page_title": "", "dimension": "",
+            "source": "", "order": -2,
+        }]
     # 限制 top_k
     data = [{
         "id": r.get("id", ""),
@@ -124,7 +132,7 @@ def search(req: SearchRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "wiki_version": "v2.3.0", "users": len(store.users)}
+    return {"status": "ok", "wiki_version": "v2.4.0", "users": len(store.users)}
 
 
 if __name__ == "__main__":

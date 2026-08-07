@@ -39,6 +39,23 @@ def normalize_relative_times(text: str, ref_date: Optional[datetime.date] = None
     for pattern in [r"(?i)\b(last|this|next)\s+(mon|tue|wed|thu|fri|sat|sun)(day)?\b",
                     r"(上|这|下)(周|星期)(一|二|三|四|五|六|日|天)"]:
         text = re.sub(pattern, lambda m: _weekday_replace(m, ref), text)
+    # "X days/weeks/months ago" → 绝对日期（时序题"how many days ago did I..." 命门）
+    # 例：ref=2023/03/01, "3 days ago" → "2023-02-26"
+    text = re.sub(r"(?i)\b(\d+)\s+(days?|weeks?|months?|years?)\s+ago\b",
+                  lambda m: str(ref - datetime.timedelta(
+                      days=int(m.group(1)) * {
+                          "day": 1, "days": 1, "week": 7, "weeks": 7,
+                          "month": 30, "months": 30, "year": 365, "years": 365,
+                      }[m.group(2).lower()])),
+                  text)
+    # "X days/weeks later" → 未来日期
+    text = re.sub(r"(?i)\b(\d+)\s+(days?|weeks?|months?)\s+(later|from now|from today)\b",
+                  lambda m: str(ref + datetime.timedelta(
+                      days=int(m.group(1)) * {
+                          "day": 1, "days": 1, "week": 7, "weeks": 7,
+                          "month": 30, "months": 30,
+                      }[m.group(2).lower()])),
+                  text)
     return text
 
 
@@ -70,6 +87,19 @@ def _weekday_replace(m, ref: datetime.date) -> str:
 def extract_session_date(memory: str) -> Optional[datetime.date]:
     """从 LongMemEval full_input 提取对话日期（Session YYYY/MM/DD）。"""
     m = re.search(r"Session\s+(\d{4})/(\d{1,2})/(\d{1,2})", memory)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def extract_current_date(memory: str) -> Optional[datetime.date]:
+    """从 focused_input 提取 "Current Date: YYYY/MM/DD"（时序题命门）。
+    Super Bowl 题证明：Current Date 是 answer 算"X days ago"的参考锚点，
+    不提取则 answer 无法推算相对现在的时间。"""
+    m = re.search(r"Current\s+Date:\s*(\d{4})/(\d{1,2})/(\d{1,2})", memory, re.I)
     if m:
         try:
             return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
