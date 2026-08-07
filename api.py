@@ -15,7 +15,7 @@ from orchestration import make_orchestrator
 from llm_config import LLM_BASE_URL, LLM_API_KEY, FAST_MODEL
 from entity_extractor import build_count_hint
 
-app = FastAPI(title="MemFusion v2", version="2.6.0")
+app = FastAPI(title="MemFusion v2", version="2.6.1")
 
 store: WikiStore = get_store()
 decider = LLMDecider(api_key=LLM_API_KEY, base_url=LLM_BASE_URL + "/chat/completions", model=FAST_MODEL)
@@ -63,7 +63,10 @@ def add(req: AddRequest):
             parsed.extend(store.parse_dialog(c))
         else:
             parsed.append(m)
-    store.ingest(req.user_id, parsed, writer=writer, session_id=req.session_id)
+    # P0(检索侧 agent 端到端验证)：用 writer=None 保留原文，不用 LLM-writer 替换。
+    # LLM-writer 把英文原文抽成中文 facts 替换 → answer 级 40→33(-13%)。
+    # 评测(USE_LLM_WRITER=0)走 writer=None 得 46，生产必须一致。
+    store.ingest(req.user_id, parsed, writer=None, session_id=req.session_id)
     return {
         "success": True,
         "request_id": req.request_id,
@@ -126,7 +129,7 @@ def search(req: SearchRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "wiki_version": "v2.6.0", "users": len(store.users)}
+    return {"status": "ok", "wiki_version": "v2.6.1", "users": len(store.users)}
 
 
 if __name__ == "__main__":
