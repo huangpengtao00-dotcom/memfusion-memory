@@ -319,10 +319,57 @@ class ExploreAgent:
             # 无论有无证据都返回（有证据返回结果，没证据返回空）——不做多步导航，保评测快
             # 多步 ReAct 循环已删除（Fable5 B：原 323-350 行 for 循环在 318 行 return 后
             # 永远不可达 = 死代码；单步 + _expand_neighbors 确定性链接展开已覆盖其意图）
-            return self._dedup(state.get("evidence", []))
+            results = self._dedup(state.get("evidence", []))
+            # v2.5：时序题 "X days/weeks ago" 的参考锚点——把 user_meta 里的 Current Date
+            # 作为一条 as-of 证据上送（此前只加了 api.py /search，评测直接走 explore 拿不到，
+            # Super Bowl 题因此算不出"17 days ago" → INSUFFICIENT）
+            # v2.5c：只对**有时序意图**的问题上送 as-of（count/偏好/事实题带上 [as-of:] 是纯噪音，
+            # 维度侧实测让 count 题 answer 数偏）。asof 变量仍保留给 time-hint 用。
+            asof = None
+            try:
+                asof = self.store.get_user_meta(user_id, "current_date")
+                if asof and self._has_temporal_intent(query):
+                    results = results + [{
+                        "id": "as-of",
+                        "content": f"[as-of: {asof}]",
+                        "score": 0.5,
+                        "page_title": "", "dimension": "",
+                        "source": "", "temporal": None,
+                        "confidence": 1.0, "polarity": "positive",
+                    }]
+            except Exception:
+                asof = None
+            # v2.5b：answer 模型(qwen-plus)日期算术弱，即使有 [date:] 元数据，
+            # "days ago" 会算偏、"days passed between" 算成 0。这里用证据里确定性的
+            # [date:] 元数据预计算差，注入 [time-hint]，answer 模型只须照抄。
+            # 保守触发（日期不全不注入，避免污染召回）。放最前保证不被 results[:10] 截断。
+            try:
+                from temporal_hint import build_temporal_hint
+                hint = build_temporal_hint(query, results, asof)
+                if hint:
+                    results = [{
+                        "id": "time-hint", "content": hint, "score": 1.0,
+                        "page_title": "", "dimension": "",
+                        "source": "", "temporal": None,
+                        "confidence": 1.0, "polarity": "positive",
+                    }] + results
+            except Exception:
+                pass
+            return results
         except Exception:
             self.last_diag = {"error": True}
             return self._dedup(state.get("evidence", []))
+
+    @staticmethod
+    def _has_temporal_intent(query: str) -> bool:
+        """粗略判断问题是否有时序意图（"X days/weeks ago"、"between events"、"what date/time"）。
+        用于决定是否上送 [as-of:] 当前日期锚点——只对时序题有用，count/事实/偏好题带上是噪音。"""
+        ql = query.lower()
+        markers = ["ago", "days", "weeks", "months", "hours", "how long",
+                   "what time", "when", "between", " date", "date ", "the date",
+                   "yesterday", "today", "how many days", "how many weeks",
+                   "how many months", "how many hours", "last week", "this week"]
+        return any(m in ql for m in markers)
 
     @staticmethod
     def detect_query_type(query: str) -> str:

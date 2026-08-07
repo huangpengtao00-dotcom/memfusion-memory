@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import uuid
 import time
+import math
+import re
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Set
 
@@ -78,6 +81,81 @@ class Dimension:
         self.pages[page.id] = page
 
 
+# ---------------- BM25 检索 ----------------
+
+# 英文停用词（检索噪音）：query 和文档词项统一过滤，让分数集中在内容词上。
+# 注意：否定词 not/never 故意不进停用词——虽会增加少量噪音，
+# 但 personamem 偏好更新依赖极性判断（_is_negation + polarity 头），
+# 召回阶段保留 not 可避免"doesn't like"被误召回为"likes"。
+BM25_STOP = set("""a an the and or but if because when what which who whom this that these those
+i me my we our you your he his him she her they them their it its is are was were be been being
+am do does did doing have has had having to of in on at for from by with without as no so
+than then too very just about some any all can could would should will shall may might must
+there here where how why up down out off over under again further once above below between
+please could tell know need want going get got""".split())
+
+_BM25_RE_HAN = re.compile(r"[一-鿿]+")
+_BM25_RE_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _bm25_tokenize(text: str) -> List[str]:
+    """中英文混合词项（带频率）：英文词（去停用词）+ 中文 2-gram。
+
+    与 _tokenize（集合，词重叠度用）不同：保留频率，供 BM25 计算词频饱和。
+    """
+    text = text.lower()
+    terms: List[str] = []
+    for w in _BM25_RE_WORD.findall(text):
+        if w not in BM25_STOP:
+            terms.append(w)
+    for h in _BM25_RE_HAN.findall(text):
+        for i in range(max(0, len(h) - 1)):
+            terms.append(h[i:i + 2])
+    return terms
+
+
+class BM25Index:
+    """真实 BM25：IDF + 词频饱和 k1 + 长度归一 b（Lucene 变体 IDF 公式）。
+
+    不可变索引：写入后重建（WikiStore 按 user 缓存，ingest 时失效）。
+    docs 是 section.content 列表，与调用方 section 顺序一一对应。
+    """
+
+    def __init__(self, docs: List[str], k1: float = 1.5, b: float = 0.75):
+        self.docs = list(docs)
+        self.k1 = k1
+        self.b = b
+        self.doc_terms = [_bm25_tokenize(d) for d in self.docs]
+        self.dl = [len(t) for t in self.doc_terms]
+        self.N = len(self.docs)
+        self.avgdl = sum(self.dl) / max(self.N, 1)
+        # 文档频率（df）：词出现在多少篇文档里（每篇只计一次）
+        self.df: Dict[str, int] = {}
+        for terms in self.doc_terms:
+            for t in set(terms):
+                self.df[t] = self.df.get(t, 0) + 1
+        # IDF（Lucene 变体，避免除零；新词（df=0）idf 取 0，不贡献分数）
+        self.idf = {t: math.log(1.0 + (self.N - n + 0.5) / (n + 0.5))
+                    for t, n in self.df.items()}
+        self._tfs = [Counter(t) for t in self.doc_terms]
+        # 长度归一常数预计算：k1 * (1 - b + b * dl/avgdl)
+        self._denoms = [self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                        for dl in self.dl]
+
+    def score_doc(self, qterms: List[str], di: int) -> float:
+        tf = self._tfs[di]
+        denom = self._denoms[di]
+        s = 0.0
+        for t in qterms:
+            f = tf.get(t, 0)
+            if f:
+                s += self.idf.get(t, 0.0) * f * (self.k1 + 1) / (f + denom)
+        return s
+
+    def scores(self, qterms: List[str]) -> List[float]:
+        return [self.score_doc(qterms, i) for i in range(self.N)]
+
+
 # ---------------- 存储层 ----------------
 
 class WikiStore:
@@ -92,6 +170,15 @@ class WikiStore:
         self.user_meta: Dict[str, Dict] = {}
         # 线程锁：FastAPI 多线程并发 Add/Search，写操作需要保护
         self._lock = __import__("threading").RLock()
+        # BM25 索引缓存：user_id -> (write_ver, BM25Index)。ingest 后失效重建。
+        self._bm25_cache: Dict[str, tuple] = {}
+        self._bm25_ver: Dict[str, int] = {}  # user_id -> 写入版本
+        # 检索融合配置（RRF 参数可调，评测对比用）：
+        #   rrf_k       RRF 常数 k（越小越看重靠前 rank）
+        #   w_kw/w_emb  关键词/语义两腿权重（=1 即标准 RRF 等权）
+        #   score_mode  返回证据的 score 字段："rrf" 用融合分（推荐，驱动顶层排序），
+        #               "emb" 用 embedding 余弦（旧行为），"kw" 用 BM25 分
+        self.search_cfg: Dict = {"rrf_k": 60, "w_kw": 1.0, "w_emb": 1.0, "score_mode": "rrf"}
 
     def set_user_meta(self, user_id: str, key: str, value) -> None:
         with self._lock:
@@ -175,6 +262,9 @@ class WikiStore:
         """加锁内的实际写入逻辑。"""
         dims = self._ensure_user(user_id)
         written = 0
+        # 写入会改变 section 集合 → BM25 索引失效（懒重建）
+        self._bm25_ver[user_id] = self._bm25_ver.get(user_id, 0) + 1
+        self._bm25_cache.pop(user_id, None)
         pages_this_batch: List[Page] = []
 
         # 提取会话日期作为相对时间归一化锚点（bug 修复：不用 today()）
@@ -198,15 +288,18 @@ class WikiStore:
             pass
 
         # 提取 "Current Date"（时序题 "X days ago" 参考锚点，Super Bowl 题证明是命门）
+        # v2.5：parse_dialog 已把 focused 尾部 "Current Date" 附到每条消息的
+        # msg["current_date"]（旧代码只扫 content，而 "Current Date:" 不在任何消息
+        # content 里 → user_meta 永远是 None，as-of 永远上送不了）。
+        current_date = None
         try:
             from time_utils import extract_current_date
-            cur = None
             for msg in messages:
-                cur = extract_current_date(msg.get("content", ""))
-                if cur:
+                current_date = msg.get("current_date") or extract_current_date(msg.get("content", ""))
+                if current_date:
                     break
-            if cur is not None:
-                self.set_user_meta(user_id, "current_date", str(cur))
+            if current_date is not None:
+                self.set_user_meta(user_id, "current_date", str(current_date))
         except Exception:
             pass
 
@@ -219,10 +312,14 @@ class WikiStore:
             if not msg.get("source"):
                 msg["source"] = session_id or f"{user_id}:batch"
 
-            # 相对时间归一化（用会话日期当锚点，不用 today()）
+            # 相对时间归一化（v2.5：锚点用**本条消息自己的会话日期**——"today/yesterday/
+            # X days ago" 相对它所在会话算。旧代码拿全批第一个会话日期当全局锚，
+            # 多会话 focused 里第二/第三会话的 "today" 全被压平到第一个会话日期，
+            # "between events" 题系统性算成 0 天。current_date 只做 as-of 锚点，不做归一化锚）
             try:
                 from time_utils import normalize_relative_times
-                content = normalize_relative_times(content, ref_date=session_date)
+                ref = msg.get("session_date") or session_date or current_date
+                content = normalize_relative_times(content, ref_date=ref)
             except Exception:
                 pass
 
@@ -306,88 +403,137 @@ class WikiStore:
         return written
 
     # ---- 简单检索（后续 explore agent 用）----
-    def keyword_search(self, user_id: str, query: str, top_k: int = 10) -> List[Dict]:
-        """关键词匹配页面/章节（占位，explore agent 阶段换 embedding）。"""
-        q = self._tokenize(query)
-        results = []
+    def _collect_sections(self, user_id: str) -> List[tuple]:
+        """收集 (dim, page, section)，保证与 BM25 索引的 docs 顺序一致。"""
         dims = self._ensure_user(user_id)
-        now = time.time()
+        sections: List[tuple] = []
         for dim in dims.values():
             for page in dim.pages.values():
                 for section in page.sections.values():
-                    score = self._overlap(q, section.content)
-                    if score > 0:
-                        results.append({
-                            "id": page.id,
-                            "content": section.content,
-                            "score": round(score, 4),
-                            "page_title": page.title,
-                            "dimension": dim.name,
-                            "created_at": section.temporal,
-                        })
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:top_k]
+                    sections.append((dim, page, section))
+        return sections
+
+    def _get_bm25(self, user_id: str, sections: List[tuple]) -> BM25Index:
+        """按 user 取 BM25 索引（带写入版本缓存）。"""
+        docs = [sec.content for _, _, sec in sections]
+        ver = self._bm25_ver.get(user_id, 0)
+        cached = self._bm25_cache.get(user_id)
+        if cached and cached[0] == ver:
+            return cached[1]
+        index = BM25Index(docs)
+        self._bm25_cache[user_id] = (ver, index)
+        return index
+
+    def keyword_search(self, user_id: str, query: str, top_k: int = 10) -> List[Dict]:
+        """关键词检索：真实 BM25（IDF + 词频饱和 + 长度归一），替换旧词重叠度。"""
+        sections = self._collect_sections(user_id)
+        if not sections:
+            return []
+        index = self._get_bm25(user_id, sections)
+        qterms = _bm25_tokenize(query)
+        scores = index.scores(qterms)
+        ranked = sorted(range(len(sections)), key=lambda i: -scores[i])
+        results = []
+        for i in ranked:
+            if scores[i] <= 0:
+                break  # 已按分数降序，剩余都 <=0
+            d, p, sec = sections[i]
+            results.append({
+                "id": p.id,
+                "content": sec.content,
+                "score": round(scores[i], 4),
+                "page_title": p.title,
+                "dimension": d.name,
+                "created_at": sec.temporal,
+            })
+            if len(results) >= top_k:
+                break
+        return results
 
     def hybrid_search(self, user_id: str, query: str, top_k: int = 10) -> List[Dict]:
         """
-        混合检索：词频 + 语义向量，RRF 融合排序（借鉴 Mem0 / Engram）。
+        混合检索：BM25 词频 + 语义向量，RRF 融合排序（借鉴 Mem0 / Engram）。
         补词频抓不住的语义关联（如 query "items of clothing" ↔ "pick up dry cleaning"）。
         embedding 不可用时降级纯词频。
+        RRF 参数（k、两腿权重）和 score 模式由 self.search_cfg 控制（评测调优用）。
         """
-        # 1. 词频检索（keyword_search 已有）
-        kw = self.keyword_search(user_id, query, top_k=top_k)
-        kw_ids = [r["id"] for r in kw]
-        kw_rank = {rid: i + 1 for i, rid in enumerate(kw_ids)}
+        cfg = self.search_cfg
+        K = float(cfg.get("rrf_k", 60))
+        w_kw = float(cfg.get("w_kw", 1.0))
+        w_emb = float(cfg.get("w_emb", 1.0))
+        score_mode = cfg.get("score_mode", "rrf")
 
-        # 2. 语义向量检索
-        dims = self._ensure_user(user_id)
-        memories = []
-        mem_map = {}  # id -> section
-        for dim in dims.values():
-            for page in dim.pages.values():
-                for section in page.sections.values():
-                    memories.append(section.content)
-                    mem_map[section.content] = {
-                        "id": page.id,
-                        "content": section.content,
-                        "score": 0.0,
-                        "page_title": page.title,
-                        "dimension": dim.name,
-                        "source": section.source,       # 证据溯源
-                        "temporal": section.temporal,   # 时间锚点
-                        "confidence": section.confidence,  # 抽取置信度
-                        "polarity": section.polarity,   # 极性（Fable5：否定≠低置信）
-                        "order": section.order,         # 消息序号（滑动窗口用）
-                        "speaker": section.facts[0] if section.facts else "",  # speaker 占位
-                    }
+        # 1. 收集全部 section，docs 顺序 = mem_map 键顺序（保证 rank 对齐）
+        sections = self._collect_sections(user_id)
+        if not sections:
+            return []
+        docs = [sec.content for _, _, sec in sections]
+        mem_map = {}
+        for d, p, sec in sections:
+            mem_map[sec.content] = {
+                "id": p.id,
+                "content": sec.content,
+                "score": 0.0,
+                "page_title": p.title,
+                "dimension": d.name,
+                "source": sec.source,       # 证据溯源
+                "temporal": sec.temporal,   # 时间锚点
+                "confidence": sec.confidence,  # 抽取置信度
+                "polarity": sec.polarity,   # 极性（Fable5：否定≠低置信）
+                "order": sec.order,         # 消息序号（滑动窗口用）
+                "speaker": sec.facts[0] if sec.facts else "",  # speaker 占位
+            }
 
-        emb_scores = {}
-        if memories:
+        # 2. BM25 全量 rank（不只 top_k，让 RRF 能看到全部命中文档）
+        index = self._get_bm25(user_id, sections)
+        qterms = _bm25_tokenize(query)
+        kw_scores = index.scores(qterms)
+        kw_score_map = {docs[i]: kw_scores[i] for i in range(len(docs))}
+        kw_rank = {}
+        order = sorted(range(len(docs)), key=lambda i: -kw_scores[i])
+        for rank, i in enumerate(order):
+            if kw_scores[i] <= 0:
+                break
+            kw_rank[docs[i]] = rank + 1
+
+        # 3. 语义向量 rank
+        emb_rank = {}
+        emb_sim = {}
+        if docs:
             from embedder import get_embedder
-            scores = get_embedder().search(query, memories, top_k=top_k)
-            # 按相似度排序取 rank（content -> rank）
-            order = sorted(range(len(memories)), key=lambda i: -scores[i])
-            for rank, idx in enumerate(order):
-                c = memories[idx]
-                emb_scores[c] = rank + 1
-                mem_map[c]["score"] = round(float(scores[idx]), 4)
+            sims = get_embedder().search(query, docs, top_k=top_k)
+            # 全部相似度为 0 = embedding 不可用/失败 → 跳过语义腿（避免 0 分噪音 rank）
+            if max(sims) > 0:
+                emb_sim = {docs[i]: sims[i] for i in range(len(docs))}
+                eorder = sorted(range(len(docs)), key=lambda i: -sims[i])
+                for rank, i in enumerate(eorder):
+                    emb_rank[docs[i]] = rank + 1
+                    mem_map[docs[i]]["score"] = round(float(sims[i]), 4)
 
-        # 3. RRF 融合：score = sum(1/(k + rank))，k=60
-        K = 60
+        # 4. RRF 融合：score = w_kw/(K+kw_rank) + w_emb/(K+emb_rank)
         rrf = {}
         for c in mem_map:
             s = 0.0
             if c in kw_rank:
-                s += 1.0 / (K + kw_rank[c])
-            if c in emb_scores:  # 语义 rank（content -> rank）
-                s += 1.0 / (K + emb_scores[c])
+                s += w_kw / (K + kw_rank[c])
+            if c in emb_rank:
+                s += w_emb / (K + emb_rank[c])
             rrf[c] = s
 
-        # 按 RRF 排序
+        # 5. 按 RRF 排序，取 top_k；只保留至少命中一腿的（RRF>0）
         sorted_content = sorted(rrf, key=rrf.get, reverse=True)
         results = [mem_map[c] for c in sorted_content[:top_k]]
-        # 只保留"至少被词频或语义命中"的（RRF>0）
         results = [r for r in results if rrf.get(r["content"], 0) > 0]
+
+        # 6. 证据 score（explore._dedup 按它排序 → 决定 answer 模型看到的 top 顺序）
+        for r in results:
+            c = r["content"]
+            if score_mode == "rrf":
+                r["score"] = round(rrf.get(c, 0.0), 6)
+            elif score_mode == "kw":
+                r["score"] = round(kw_score_map.get(c, 0.0), 4)
+            # score_mode == "emb" → 保持 embedding 余弦（已在第 3 步设置）
+
         # 滑动窗口扩展：命中消息的相邻消息也补召回（对话连续性，locomo/scriptmem 事件簇）
         results = self._expand_neighbors(user_id, results, window=2, max_extra=10)
         # count 聚簇提示由 api.py 的 LLM 实体提取(build_count_hint)负责，这里不重复
@@ -535,36 +681,58 @@ class WikiStore:
         解析对话历史（LongMemEval 等格式）为消息列表。
         full_input 是 "History Chats: ... [{'role':.., 'content':..}, ...]" 字符串。
         按消息建记忆（比按 chunk 更能精确召回答案所在的消息）。
+
+        v2.5 修复（时序题 "X days between events" 命门）：
+        focused_input 可能含**多个会话块**（每个 "Session YYYY/MM/DD" 头后面跟若干消息），
+        此前所有消息都拿第一个会话的日期当锚点 → 第二/第三会话里 "today" 归一化到
+        第一个会话日期，事件日全被压平 → "between events" 题算成 0 天。
+        现在每条消息归属其**最近的 Session 头**，用自己的会话日期做锚。
+        同时把 focused 尾部的 "Current Date"（"X days ago" 参考锚点）附到每条消息，
+        ingest 才能写进 user_meta。
         """
         import re
         import datetime as _dt
-        # 会话日期在 full_input 头部（"History Chats:Session 2023/02/15 ..."），
-        # 不在消息 content 里——先提取，后面附到每条消息上，ingest 才能用对锚点
-        session_date = None
+        # Current Date 在 focused_input 尾部（"Current Date: 2023/03/01 ..."），
+        # 不在任何消息 content 里——直接整串扫，附到每条消息供 ingest 用
+        current_date = None
         try:
-            from time_utils import extract_session_date
-            session_date = extract_session_date(memory)
+            from time_utils import extract_current_date
+            current_date = extract_current_date(memory)
         except Exception:
             pass
-        # 会话时间锚点：用会话日期生成 epoch（UTC 午夜），写进消息 timestamp，
-        # 让 section.temporal 有值 → 证据带 [date:] 头（时序题必需）
-        timestamp = None
-        try:
-            if session_date is not None:
-                ts_epoch = _dt.datetime(session_date.year, session_date.month,
-                                        session_date.day, tzinfo=_dt.timezone.utc)
-                timestamp = int(ts_epoch.timestamp() * 1000)
-        except Exception:
-            pass
-        # 会话标识：从头部提取 Session YYYY/MM/DD 片段作为同源分组键
-        # （_expand_neighbors 按 source 分组判相邻，无 source 时窗口扩展完全失效）
-        source = "dialog"
-        try:
-            m = re.search(r"History Chats:\s*(Session[^:]*:?)", memory)
-            if m:
-                source = m.group(1).strip(" :")
-        except Exception:
-            pass
+
+        # 收集所有 Session 头（含位置）。每条消息归属它前面最近的 Session。
+        # 格式：History Chats:Session 2023/02/14 (Tue) 16:29: / Session 2023/03/15 (Wed) 08:37:
+        headers = []  # (pos, date, source)
+        for m in re.finditer(r"Session\s+(\d{4})/(\d{1,2})/(\d{1,2})[^\n]*", memory):
+            try:
+                d = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                continue
+            src = m.group(0).strip()
+            ci = src.find(":")  # 到行内第一个冒号（去掉秒），保持旧 source 风格
+            if ci != -1:
+                src = src[:ci]
+            headers.append((m.start(), d, src.strip()))
+
+        def _nearest(pos: int):
+            """pos 前最近的 session 头 (date, source)；无则回退 ('dialog')。"""
+            date, src = None, "dialog"
+            for hpos, hdate, hsrc in headers:
+                if hpos < pos:
+                    date, src = hdate, hsrc
+                else:
+                    break
+            return date, src
+
+        def _ts(d):
+            if d is None:
+                return None
+            try:
+                return int(_dt.datetime(d.year, d.month, d.day,
+                                        tzinfo=_dt.timezone.utc).timestamp() * 1000)
+            except Exception:
+                return None
 
         msgs = []
         # content 用双引号或单引号包裹（如 "I'm making progress..." / 'content'）。
@@ -574,18 +742,23 @@ class WikiStore:
         for m in re.finditer(pattern, memory):
             role, content = m.group(1), m.group(2) if m.group(2) is not None else m.group(3)
             content = content.replace("\\n", "\n").replace("\\'", "'").replace('\\"', '"')
-            if content.strip():
-                msgs.append({"role": role, "content": content,
-                             "session_date": session_date,
-                             "timestamp": timestamp,
-                             "source": source})
+            if not content.strip():
+                continue
+            sdate, src = _nearest(m.start())
+            msgs.append({"role": role, "content": content,
+                         "session_date": sdate,
+                         "timestamp": _ts(sdate),
+                         "source": src,
+                         "current_date": current_date})
             if len(msgs) >= max_msgs:
                 break
         if not msgs:
+            sdate, src = (headers[0][1], headers[0][2]) if headers else (None, "dialog")
             msgs = [{"role": "user", "content": memory,
-                     "session_date": session_date,
-                     "timestamp": timestamp,
-                     "source": source}]
+                     "session_date": sdate,
+                     "timestamp": _ts(sdate),
+                     "source": src,
+                     "current_date": current_date}]
         return msgs
 
     @staticmethod
@@ -599,6 +772,11 @@ class WikiStore:
             for i in range(max(0, len(h) - 1)):
                 words.add(h[i:i+2])
         return words
+
+    @classmethod
+    def _tokenize_terms(cls, text: str) -> List[str]:
+        """带频率的中英文词项（去英文停用词）——BM25 用。"""
+        return _bm25_tokenize(text)
 
     @classmethod
     def _overlap(cls, q: Set[str], text: str) -> float:

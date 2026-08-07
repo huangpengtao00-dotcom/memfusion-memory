@@ -113,14 +113,8 @@ def search(req: SearchRequest):
         )
     except Exception:
         pass
-    # 上送 Current Date（时序题 "X days ago" 参考锚点，否则 answer 无法推算相对现在时间）
-    asof = store.get_user_meta(req.user_id, "current_date")
-    if asof:
-        results = results + [{
-            "id": "as-of", "content": f"[as-of: {asof}]",
-            "score": 0.4, "page_title": "", "dimension": "",
-            "source": "", "order": -2,
-        }]
+    # 上送 Current Date（时序题 "X days ago" 参考锚点）已由 explore() 统一注入 as-of 证据，
+    # 这里不再重复追加，避免同一条 as-of 出现两次。
     # 限制 top_k
     data = [{
         "id": r.get("id", ""),
