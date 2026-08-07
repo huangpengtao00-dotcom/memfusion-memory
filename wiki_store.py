@@ -99,16 +99,45 @@ _BM25_RE_HAN = re.compile(r"[一-鿿]+")
 _BM25_RE_WORD = re.compile(r"[a-z0-9]+")
 
 
+def _singular_form(word: str) -> str:
+    """保守英文单数化（规则复数 → 单数，供 BM25 词形归一）。
+
+    full_input(500 条)下最大召回杀手是 query 复数 vs 消息单数：
+    "tanks"匹配不到"tank"、"festivals"匹配不到"festival" → BM25 分数 0，
+    答案消息排不进 top-k。这里把英文词规约到单数（tank/tanks → tank），
+    索引与 query 两侧同时归一，单复数即等价。
+
+    只处理规则复数，保护以 -ss/-us/-is/-as/-os 结尾的固有单数（bus/class/
+    this/analysis/gas 等），避免过度剥离。
+    """
+    if len(word) <= 3:
+        return word
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"                  # babies -> baby, movies 不命中
+    if word.endswith("sses"):
+        return word[:-2]                        # classes -> class
+    if word.endswith(("xes", "ches", "shes", "zes")) and len(word) > 4:
+        return word[:-2]                        # boxes -> box, watches -> watch
+    if word.endswith("ses") and len(word) > 4:
+        return word[:-1]                        # houses -> house, cases -> case
+    if word.endswith("es") and len(word) > 3:
+        return word[:-2]                        # 其他 -es（goes -> go）
+    if word.endswith("s") and not word.endswith(("ss", "us", "is", "as", "os")):
+        return word[:-1]                        # tanks -> tank, hours -> hour
+    return word
+
+
 def _bm25_tokenize(text: str) -> List[str]:
-    """中英文混合词项（带频率）：英文词（去停用词）+ 中文 2-gram。
+    """中英文混合词项（带频率）：英文词（去停用词+单数化）+ 中文 2-gram。
 
     与 _tokenize（集合，词重叠度用）不同：保留频率，供 BM25 计算词频饱和。
+    英文词统一规约到单数（full_input 长对话下复数 query 匹配单数消息的命门）。
     """
     text = text.lower()
     terms: List[str] = []
     for w in _BM25_RE_WORD.findall(text):
         if w not in BM25_STOP:
-            terms.append(w)
+            terms.append(_singular_form(w))
     for h in _BM25_RE_HAN.findall(text):
         for i in range(max(0, len(h) - 1)):
             terms.append(h[i:i + 2])
@@ -502,10 +531,12 @@ class WikiStore:
                 break
             kw_rank[docs[i]] = rank + 1
 
-        # 3. 语义向量 rank
+        # 3. 语义向量 rank（use_emb=False 时跳过——full_input 500条长对话 embedding
+        #    极慢(~90s/条),且长消息截断后语义不可靠;评测迭代和定位时用 BM25 单腿快跑）
         emb_rank = {}
         emb_sim = {}
-        if docs:
+        use_emb = bool(cfg.get("use_emb", True))
+        if docs and use_emb:
             from embedder import get_embedder
             sims = get_embedder().search(query, docs, top_k=top_k)
             # 全部相似度为 0 = embedding 不可用/失败 → 跳过语义腿（避免 0 分噪音 rank）
@@ -578,6 +609,16 @@ class WikiStore:
 
         extra = []
         seen = {r["content"] for r in results}
+        # v2.7：邻居消息分必须低于所有真实命中，否则 explore._dedup 按 score 降序
+        # 重排时邻居挤到 top（full_input 500 条下 RRF 分 ~0.016 < 0.3），把答案消息
+        # 挤出 top-10 → 时序/count 题 INSUFFICIENT。取命中最低分做地板，保证邻居殿后。
+        floor = 0.0
+        if results:
+            try:
+                floor = min(float(r.get("score", 0) or 0) for r in results) - 0.001
+            except Exception:
+                floor = 0.0
+        floor = max(floor, 0.0)  # 不为负
         for src, orders in by_source.items():
             orders_list = sorted(orders)
             for (order, content, page_id, source) in orders_list:
@@ -589,7 +630,7 @@ class WikiStore:
                     if h_src == src and abs(order - h_order) <= window:
                         if content not in seen and len(extra) < max_extra:
                             extra.append({
-                                "id": page_id, "content": content, "score": 0.3,
+                                "id": page_id, "content": content, "score": floor,
                                 "source": source, "order": order,
                                 "page_title": "", "dimension": "",
                             })

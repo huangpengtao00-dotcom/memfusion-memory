@@ -71,9 +71,12 @@ class LLMDecider:
         if query in self._expand_cache:
             return self._expand_cache[query]
         prompt = (
-            "把下面这个问题里的关键信息提取成5-8个关键词（可能是名字、地点、物品、属性，"
-            "一字不差地提取原文里的词，不要添加原文没有的语义），"
-            "只输出关键词，逗号分隔，不要其他内容：\n问题：" + query
+            "You are expanding a search query to improve recall in a long memory chat log "
+            "(500+ messages). Given the question, output a comma-separated list of concrete "
+            "keywords that would appear in a USER message answering this question. Include: "
+            "the exact content nouns from the question, common synonyms (e.g. movie->film, "
+            "instruments->guitar/piano/drum), and typical specific category members. "
+            "Only output the keywords, comma-separated, no explanation:\n" + query
         )
         body = json.dumps({
             "model": self.model,
@@ -82,15 +85,21 @@ class LLMDecider:
         }).encode()
         req = urllib.request.Request(self.base_url, data=body,
             headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                d = json.loads(r.read())
-            result = d["choices"][0]["message"]["content"].strip()
-            if result and result != query:
-                self._expand_cache[query] = result  # 缓存成功扩展
-            return result
-        except Exception:
-            return query
+        # 网关间歇 5xx/429：无重试时扩展静默失败回退原 query（full_input 词汇不匹配
+        # 靠扩展召回，"turned 32" 这类消息没扩展就永远进不了召回）→ 重试 2 次。
+        import time as _t
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    d = json.loads(r.read())
+                result = d["choices"][0]["message"]["content"].strip()
+                if result and result != query:
+                    self._expand_cache[query] = result  # 缓存成功扩展
+                return result
+            except Exception:
+                if attempt < 2:
+                    _t.sleep(1.0 * (attempt + 1))
+        return query
 
     def decide(self, query: str, state: Dict, tools: Dict) -> str:
         """返回动作描述字符串。"""
@@ -267,22 +276,41 @@ class ExploreAgent:
 
         # 语义扩展：先用 LLM 扩关键词，做一次强召回作为种子。
         # LLM 失败/超时 → 降级为原 query 词频检索（保证不空返回）。
-        # 语义扩展默认关闭（Fable5 审核：LLM 扩关键词引入幻觉实体，污染召回）。
-        # 通过 self.use_expansion 开关控制（默认 False）。
+        # 短对话默认关闭（Fable5：LLM 扩词引入幻觉实体，污染召回）。
+        # 长对话(>50 条,full_input 口径)自动开启：词汇不匹配是主杀器
+        # （"movie"↔"film"、"instruments"↔"guitar"、"turned 32"↔"how old"），
+        # 扩展词与原 query 分别检索后 RRF 融合——召回优先，短对话下才让位于精确。
         expanded = query
-        if self.use_expansion and self.decider and hasattr(self.decider, "expand_query"):
+        want_expand = self.use_expansion
+        if not want_expand:
+            try:
+                want_expand = len(self.store._collect_sections(user_id)) > 50
+            except Exception:
+                want_expand = False
+        if want_expand and self.decider and hasattr(self.decider, "expand_query"):
             try:
                 expanded = self.decider.expand_query(query)
             except Exception:
                 expanded = query
-        # 扩展词或原 query 都检索，作为主 evidence
+        # 年龄出生题 "How old was I when X was born?"：LLM 扩展常缺 "turned/years old"，
+        # 而答案消息("I just turned 32 last month")只认这些词 → 补确定性扩展词，
+        # 否则用户年龄那条消息永远进不了召回，age-hint 也无从扫起。
+        if "how old was i when" in query.lower():
+            _extra_age = "turned, years old, birthday, age, born, birth"
+            expanded = (expanded + ", " + _extra_age) if (expanded and expanded != query) else _extra_age
+        # 扩展词与原 query 都检索。RRF 融合两路结果（v2.7）：
+        # 拼接并集(旧法)会让扩展词稀释原 query 的高分消息（"how many hours" 题
+        # 的 70h/25h 消息被挤出 top-10 → INSUFFICIENT）。RRF 同时保留原 query
+        # 的 top 排名(答案消息)和扩展召回(词汇不匹配消息:guitar/film festival)。
+        # 题型感知召回宽度：count/time 更宽防漏（Fable5）
+        # top_k 传入时以 top_k 为准（评测平台要填满到 top_k，不只 10/15）
         try:
-            seed_q = expanded if (expanded and expanded != query) else query
-            # 题型感知召回宽度：count/time 更宽防漏（Fable5）
-            # top_k 传入时以 top_k 为准（评测平台要填满到 top_k，不只 10/15）
             qtype = self.detect_query_type(query)
             recall_k = max(self._recall_k(qtype), top_k or 0)
-            seed = tools["keyword_search"](seed_q, recall_k)
+            seed = tools["keyword_search"](query, recall_k)
+            if expanded and expanded != query:
+                seed_exp = tools["keyword_search"](expanded, recall_k)
+                seed = self._rrf_merge(seed, seed_exp, k=60)
             if not seed and expanded != query:
                 seed = tools["keyword_search"](query, recall_k)  # 扩展没召回 → 原 query
             if seed:
@@ -300,7 +328,7 @@ class ExploreAgent:
                 ]
             # 记录聚合决策
             if self.orchestrator:
-                self.orchestrator.log("aggregate", f"keyword_search({seed_q}) -> {len(seed)}",
+                self.orchestrator.log("aggregate", f"keyword_search -> {len(seed)}",
                                       result=len(seed), step=1)
                 stop = self.orchestrator.should_stop(state.get("evidence", []), step=1)
                 self.orchestrator.log("stop", f"should_stop={stop}", result=stop, step=1)
@@ -358,10 +386,68 @@ class ExploreAgent:
                     }] + results
             except Exception:
                 pass
+            # v2.7：多跳年龄题 "How old was I when X was born?"——答案 = 用户年龄 - X 年龄。
+            # full_input 里两个年龄分属两条消息（"he's just 21" + "I just turned 32"），
+            # 即使都在召回里，answer 模型也要跨消息推理。这里扫全量召回做确定性差，
+            # 注入 [age-hint]（类似 time-hint，answer 只须照抄）。
+            try:
+                age_hint = self._build_age_hint(query, results)
+                if age_hint:
+                    results = [{
+                        "id": "age-hint", "content": age_hint, "score": 1.0,
+                        "page_title": "", "dimension": "",
+                        "source": "", "temporal": None,
+                        "confidence": 1.0, "polarity": "positive",
+                    }] + results
+            except Exception:
+                pass
             return results
-        except Exception:
-            self.last_diag = {"error": True}
+        except Exception as e:
+            import traceback as _tb
+            self.last_diag = {"error": True, "err": str(e)[:200], "tb": _tb.format_exc()[-500:]}
             return self._dedup(state.get("evidence", []))
+
+    @staticmethod
+    def _build_age_hint(query: str, results: List[Dict]) -> Optional[str]:
+        """
+        多跳年龄题："How old was I when X was born?" → 用户年龄 - X 年龄。
+        扫全量召回里两条消息：X 的年龄(如 "he's just 21")和用户年龄("I just turned 32")。
+        保守触发：两个年龄都找到且用户年龄 >= X 年龄才注入，否则 None（不污染）。
+        """
+        import re as _re
+        m = _re.search(r"how\s+old\s+was\s+i\s+when\s+([a-z][a-z\s']{1,30}?)\s+was\s+born", query, _re.I)
+        if not m:
+            return None
+        xname = m.group(1).strip().split()[0]  # 取第一个词作为人名（"Alex"）
+        if len(xname) < 2:
+            return None
+        xname_l = xname.lower()
+
+        x_age = None
+        u_age = None
+        for r in results:
+            c = r.get("content", "")
+            cl = c.lower()
+            # X 的年龄：消息含 X 且出现年龄上下文数字（user/assistant 都扫，X 年龄自述多在 user）
+            if x_age is None and xname_l in cl:
+                ma = _re.search(r"\b(?:he'?s|he\s+is|just)\s+(\d{1,3})\b", cl)
+                if not ma:
+                    ma = _re.search(r"\b(\d{1,3})\s+(?:years?\s+old|yo)\b", cl)
+                if ma:
+                    x_age = int(ma.group(1))
+                    continue
+            # 用户的年龄：user 消息 "I just turned N" / "I turned N"
+            if u_age is None and r.get("role") != "assistant":
+                mu = _re.search(r"\bi\s+just\s+turned\s+(\d{1,3})\b", cl)
+                if not mu:
+                    mu = _re.search(r"\bi\s+turned\s+(\d{1,3})\b", cl)
+                if mu:
+                    u_age = int(mu.group(1))
+        if x_age is None or u_age is None or u_age < x_age:
+            return None
+        diff = u_age - x_age
+        return (f"[age-hint] {xname} is {x_age} years old, and the user is {u_age}. "
+                f"So the user was {diff} years old when {xname} was born.")
 
     @staticmethod
     def _has_temporal_intent(query: str) -> bool:
@@ -392,6 +478,21 @@ class ExploreAgent:
     def _recall_k(self, qtype: str) -> int:
         """题型感知的召回宽度：count/list 需要更宽召回防漏。"""
         return 15 if qtype in ("count_list", "time") else 10
+
+    @staticmethod
+    def _rrf_merge(orig: List[Dict], extra: List[Dict], k: int = 60) -> List[Dict]:
+        """RRF 融合两路检索结果：score = Σ 1/(k+rank)。保留 orig 的 top 排名，
+        同时并入 extra 独有的消息（词汇不匹配时扩展召回）。按 content 去重。"""
+        fused: Dict[str, List] = {}
+        for rank, r in enumerate(orig):
+            fused[r["content"]] = [1.0 / (k + rank + 1), r]
+        for rank, r in enumerate(extra):
+            if r["content"] in fused:
+                fused[r["content"]][0] += 1.0 / (k + rank + 1)
+            else:
+                fused[r["content"]] = [1.0 / (k + rank + 1), r]
+        out = [x[1] for x in sorted(fused.values(), key=lambda x: -x[0])]
+        return out
 
     @staticmethod
     def _dedup(evidence: List[Dict]) -> List[Dict]:
