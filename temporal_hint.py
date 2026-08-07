@@ -1,17 +1,20 @@
 """
-MemFusion v2: 时序题计算提示生成（days ago / days passed between 命门）
+MemFusion v2: 时序题计算提示生成（days ago / days passed between / clock time 命门）
 
-answer 模型(qwen-plus 模拟平台)日期算术很弱：即使证据带 [date:] 元数据头，
+answer 模型(qwen-plus 模拟平台)日期/时间算术很弱：即使证据带 [date:] 元数据头，
 "days ago" 会算偏、"days passed between" 直接输出 0（两个事件日期一样时的产物）。
 这里用证据里确定性的 [date:] 元数据做算术，把结果以 [time-hint] 注入证据，
 answer 模型只须照抄，不依赖它做日期减法。
 
-只在日期充分时才触发（保守：算不准宁可不提示，避免污染召回）。
-日期来源：证据的 temporal 字段（epoch ms，parse_dialog 按 Session 头分配，写入侧保证）。
+机制3(TReMu ACL2025)：钟表时间跨消息推断（"left home at 7 AM" + "took 2 hours"
+= 9:00 AM），LLM 抽事件-时间对 + 代码链式合成。这里用正则先做简单 case。
+
+只在日期/时间充分时才触发（保守：算不准宁可不提示，避免污染召回）。
 """
 from __future__ import annotations
 
 import datetime
+import re
 from typing import List, Dict, Optional
 
 
@@ -91,3 +94,60 @@ def build_temporal_hint(query: str, results: List[Dict],
                 f"So the answer is {delta} days.")
 
     return None
+
+
+# ---- 机制3(TReMu)：钟表时间跨消息推断 ----
+_NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+              "seven": 7, "eight": 8, "nine": 9, "ten": 10, "fifteen": 15,
+              "twenty": 20, "thirty": 30}
+_TIME_MARKERS = ("what time", "at what time", "o'clock", "what hour",
+                 "几点", "什么时候到")
+
+
+def _to_num(s: str) -> Optional[int]:
+    s = s.strip().lower()
+    if s.isdigit():
+        return int(s)
+    return _NUM_WORDS.get(s)
+
+
+def _to_24h(h: int, ampm: str) -> int:
+    ampm = ampm.upper()
+    if ampm == "PM" and h < 12:
+        return h + 12
+    if ampm == "AM" and h == 12:
+        return 0
+    return h
+
+
+def _to_12h(h: int) -> str:
+    h = h % 24
+    ampm = "AM" if h < 12 else "PM"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    return f"{h12}:00 {ampm}"
+
+
+def build_clock_hint(query: str, results: List[Dict]) -> Optional[str]:
+    """钟表时间题："left home at 7 AM" + "took 2 hours" → 9:00 AM。
+    正则抽离开时间 + 时长，代码做加法。保守：抓不到返回 None。"""
+    ql = query.lower()
+    if not any(m in ql for m in _TIME_MARKERS):
+        return None
+
+    contents = [r.get("content", "") for r in results if r.get("content")]
+    joined = " ".join(contents)
+
+    dep = re.search(r"\bleft\b.*?\bat\s+(\d{1,2})\s*(am|pm)\b", joined, re.I)
+    dur = re.search(r"\btook\s+(?:me\s+)?(\d+|one|two|three|four|five|six|seven|"
+                    r"eight|nine|ten|fifteen|twenty|thirty)\s+hours?\b", joined, re.I)
+    if not (dep and dur):
+        return None
+    n = _to_num(dur.group(1))
+    if n is None:
+        return None
+    h24 = _to_24h(int(dep.group(1)), dep.group(2))
+    arrive = _to_12h(h24 + n)
+    return (f"[time-hint] {dep.group(1)} {dep.group(2).upper()} + {n} hours "
+            f"= {arrive}. So the answer is {arrive}.")

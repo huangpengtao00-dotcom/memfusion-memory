@@ -344,8 +344,10 @@ class ExploreAgent:
             # [date:] 元数据预计算差，注入 [time-hint]，answer 模型只须照抄。
             # 保守触发（日期不全不注入，避免污染召回）。放最前保证不被 results[:10] 截断。
             try:
-                from temporal_hint import build_temporal_hint
+                from temporal_hint import build_temporal_hint, build_clock_hint
                 hint = build_temporal_hint(query, results, asof)
+                if not hint:
+                    hint = build_clock_hint(query, results)  # 机制3：钟表时间跨消息推断
                 if hint:
                     results = [{
                         "id": "time-hint", "content": hint, "score": 1.0,
