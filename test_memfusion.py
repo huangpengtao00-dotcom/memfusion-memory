@@ -336,6 +336,52 @@ def test_no_evidence_query_returns_nothing():
     assert store.hybrid_search("u", "What is my blood type?", top_k=10) == []
 
 
+def test_embeddings_are_warmed_on_write():
+    """惰性算会让第一个 Search 独自扛整个用户语料的向量化,长语料上是分钟级。"""
+    import embedder
+    from wiki_store import WikiStore
+    emb = embedder.get_embedder()
+    if not emb._ensure_model():
+        return  # 无 fastembed 时跳过
+    before = len(emb._cache)
+    store = WikiStore()
+    store.ingest("warm-u", [{"role": "user", "content": f"a distinctive warm line {i}",
+                             "timestamp": None} for i in range(5)],
+                 writer=None, session_id="s1")
+    assert len(emb._cache) > before, "写入后向量缓存未增长"
+
+
+def test_embedding_cache_survives_a_restart():
+    """进程重启后重算全部向量 = 每次部署都送一次分钟级的首查。"""
+    import importlib, os, tempfile
+    import embedder
+    if not embedder.get_embedder()._ensure_model():
+        return
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "emb.pkl")
+        e1 = embedder.Embedder(persist_path=path)
+        assert e1.warm(["persisted line one", "persisted line two"]) == 2
+        assert os.path.exists(path), "未写盘"
+        e2 = embedder.Embedder(persist_path=path)
+        assert "persisted line one" in e2._cache, "重启后未加载缓存"
+        assert e2.warm(["persisted line one"]) == 0, "已缓存的不应重算"
+
+
+def test_zero_vector_does_not_overflow():
+    """np.where 会先算完两个分支,零范数那一支真的做了除法并溢出。"""
+    import warnings
+    import numpy as np
+    from embedder import Embedder
+    e = Embedder()
+    e._model = object()
+    vecs = {"zero": np.zeros(4), "unit": np.array([1.0, 0.0, 0.0, 0.0])}
+    e.embed = lambda ts: np.array([vecs.get(t, np.zeros(4)) for t in ts])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        sims = e.search("unit", ["zero", "unit"])
+    assert sims == [0.0, 1.0], sims
+
+
 if __name__ == "__main__":
     # 简单 runner（不用 pytest 也能跑）
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

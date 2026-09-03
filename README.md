@@ -158,6 +158,10 @@ What changed, all retrieval-side and with no added LLM calls:
   remove. Suppression is a marker, not a delete: the instruction itself stays as an auditable
   record, only entries earlier than it and covered by its content words are held back, and
   restating the fact afterwards is unaffected.
+- **Embeddings are computed on write, not lazily on first read.** With 679 messages in the store
+  the first Search took **104 s** because it carried the whole corpus's vectorisation; warming on
+  write brings that to **0.48 s**. Set `MEMFUSION_EMB_CACHE` to a file path and the cache also
+  survives a restart (0.33 s first Search), instead of every deploy paying for a full recompute.
 - **Synthetic evidence has an admission gate**: nothing derived is injected when there are no
   real hits, and derived items now rank below every real one. They used to score 1.0 against
   ~0.016 for genuine evidence, so a question with nothing in memory still received a

@@ -642,6 +642,16 @@ class WikiStore:
                     b.add_link(a.id, "related_to")
                 if b.id not in a.links:
                     a.add_link(b.id, "related_to")
+        # 写入侧预热向量。惰性算会让第一个 Search 请求独自承担整个用户语料的
+        # 向量化(长语料上是分钟级),而写入本来就是分批来的,摊在这里才合理。
+        if self.search_cfg.get("warm_embeddings", True) and written:
+            try:
+                from embedder import get_embedder
+                get_embedder().warm([sec.content for _d, _p, sec
+                                     in self._collect_sections(user_id)])
+            except Exception:
+                pass
+
         return written
 
     # ---- 简单检索（后续 explore agent 用）----
