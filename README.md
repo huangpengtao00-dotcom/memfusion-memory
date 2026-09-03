@@ -109,11 +109,16 @@ The metric is EvidenceRecall — whether the annotated evidence message reaches 
 
 | | before | after | delta |
 |---|---|---|---|
-| EvidenceRecall@100 | 0.7946 | **0.8595** | +0.0649 |
-| EvidenceRecall@10 | 0.5270 | **0.5797** | +0.0527 |
+| EvidenceRecall@5 | 0.4216 | **0.5470** | +0.1254 |
+| EvidenceRecall@10 | 0.5270 | **0.6277** | +0.1007 |
+| EvidenceRecall@100 | 0.7946 | **0.8591** | +0.0646 |
 | questions with zero recall | 208 | **134** | −74 |
 | multi-hop category | 0.6260 | **0.7279** | +0.1019 |
 | temporal category | 0.7883 | **0.9013** | +0.1130 |
+
+The @5 and @10 columns matter more than @100: the platform reads the returned list in order,
+and before these changes only 52.7% of the annotated evidence was reaching the first ten items
+while 79.5% was somewhere in the first hundred.
 
 What changed, all retrieval-side and with no added LLM calls:
 
@@ -139,6 +144,20 @@ What changed, all retrieval-side and with no added LLM calls:
   anchor available nothing is rewritten. The original wording is also kept and the resolution
   appended, because a judge that forbids relative/absolute conversion cannot be satisfied by
   text where the relative form has been deleted.
+- **`score` carries absolute relevance again.** It used to be the raw RRF reciprocal-rank sum, so
+  a perfect lexical hit scored 1/61 and an unrelated document 1/62 — no threshold could be built
+  on a 6% spread, which is what abstention, suppression and fallback all need. Ordering still uses
+  RRF (rank fusion is right for ordering); `score` is now a saturated BM25 term plus cosine.
+- **Neighbour items score a fraction of the weakest hit**, not "the weakest hit minus 0.001". An
+  absolute offset is no penalty at all in any scale, so ten context messages used to enter the
+  result at effectively hit-level scores — and questions that mention a topic without ever stating
+  the detail being asked are exactly the shape of an abstention test.
+- **A request to forget suppresses the old value.** The protocol has no Delete endpoint, so "please
+  forget my phone number" can only mean the old value stops coming back. It used to be stored as
+  one more memory that then competed with — and usually outranked — the thing it was meant to
+  remove. Suppression is a marker, not a delete: the instruction itself stays as an auditable
+  record, only entries earlier than it and covered by its content words are held back, and
+  restating the fact afterwards is unaffected.
 - **Synthetic evidence has an admission gate**: nothing derived is injected when there are no
   real hits, and derived items now rank below every real one. They used to score 1.0 against
   ~0.016 for genuine evidence, so a question with nothing in memory still received a

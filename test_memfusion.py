@@ -253,6 +253,89 @@ def test_derived_evidence_ranks_below_real_evidence():
         assert max(derived) <= min(reals), f"派生 {derived} 不得高于真证据 {reals}"
 
 
+def _ms(y, m, d):
+    import datetime
+    return int(datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+
+def test_forget_request_suppresses_the_old_value():
+    """协议没有 Delete 端点,"用户说忘掉"只能表现为之后检索不到旧值。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    store.ingest("u", [
+        {"role": "user", "content": "My phone number is 555-0134, save it.",
+         "timestamp": _ms(2023, 2, 1)},
+        {"role": "user", "content": "Please forget my phone number, delete it from memory.",
+         "timestamp": _ms(2023, 2, 8)},
+    ], writer=None, session_id="s1")
+    res = store.hybrid_search("u", "What is the user's phone number?", top_k=10)
+    assert not any("555-0134" in r["content"] for r in res), \
+        f"被要求忘掉的值仍被召回: {[r['content'][:40] for r in res]}"
+    assert any(r.get("id") == "suppressed" for r in res), "应留一条可审计的抑制记录"
+
+
+def test_suppression_does_not_touch_unrelated_memories():
+    """误判会把正常记忆抑制掉,所以判据是词干覆盖率而非关键词命中。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    store.ingest("u", [
+        {"role": "user", "content": "Please forget my phone number, delete it from memory.",
+         "timestamp": _ms(2023, 2, 8)},
+        {"role": "user", "content": "I love hiking in the Alps.", "timestamp": _ms(2023, 3, 1)},
+    ], writer=None, session_id="s1")
+    res = store.hybrid_search("u", "Where does the user like hiking?", top_k=10)
+    assert any("Alps" in r["content"] for r in res), "无关记忆被误杀"
+
+
+def test_restated_after_forget_is_not_suppressed():
+    """晚于遗忘指令的同一件事是新事实,不受抑制。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    store.ingest("u", [
+        {"role": "user", "content": "My phone number is 555-0134.", "timestamp": _ms(2023, 2, 1)},
+        {"role": "user", "content": "Please forget my phone number, delete it from memory.",
+         "timestamp": _ms(2023, 2, 8)},
+        {"role": "user", "content": "My new phone number is 555-9999.",
+         "timestamp": _ms(2023, 5, 1)},
+    ], writer=None, session_id="s1")
+    res = store.hybrid_search("u", "What is the user's phone number?", top_k=10)
+    joined = " ".join(r["content"] for r in res)
+    assert "555-9999" in joined, "重新说过的新值不该被抑制"
+    assert "555-0134" not in joined, "旧值仍应被挡住"
+
+
+def test_score_separates_a_hit_from_a_neighbour():
+    """邻居分原来是"最低命中分 -0.001",与真命中无法区分,阈值判断建不起来。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    msgs = [{"role": "user", "content": f"chatting about telescopes again, part {i}",
+             "timestamp": None} for i in range(12)]
+    msgs.append({"role": "user", "content": "my cardiologist prescribed atorvastatin 20mg",
+                 "timestamp": None})
+    store.ingest("u", msgs, writer=None, session_id="s1")
+    res = store.hybrid_search("u", "What medication was the user prescribed?", top_k=6)
+    hits = [r for r in res if not r.get("neighbor")]
+    nbrs = [r for r in res if r.get("neighbor")]
+    assert hits, "应有真命中"
+    if nbrs:
+        assert max(r["score"] for r in nbrs) < min(r["score"] for r in hits) * 0.6, \
+            f"邻居分未与命中分分离: 命中 {[r['score'] for r in hits]} 邻居 {[r['score'] for r in nbrs]}"
+
+
+def test_no_evidence_query_returns_nothing():
+    """零词法零语义重叠的问题必须返回空,否则拒答题无从判断。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    store.ingest("u", [{"role": "user", "content": "I went hiking in the Alps last summer.",
+                        "timestamp": None}], writer=None, session_id="s1")
+    assert store.hybrid_search("u", "What is my blood type?", top_k=10) == []
+
+
 if __name__ == "__main__":
     # 简单 runner（不用 pytest 也能跑）
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

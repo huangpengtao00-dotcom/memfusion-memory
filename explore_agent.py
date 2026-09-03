@@ -539,10 +539,16 @@ class ExploreAgent:
 
     @staticmethod
     def _dedup(evidence: List[Dict]) -> List[Dict]:
-        """去重（按 content）+ 排序（按 score 降序）。"""
+        """去重（按 content）+ 排序。
+
+        排序键优先取 rrf(名次融合,对排序正确);score 现在是绝对相关度,量纲不同,
+        拿它排序会把"稠密余弦高但两腿都没真命中"的文档抬上来。
+        无 rrf 的条目(派生项、兜底项)沉到末尾。
+        """
         seen = set()
         out = []
-        for e in sorted(evidence, key=lambda x: x.get("score", 0), reverse=True):
+        for e in sorted(evidence, key=lambda x: (x.get("rrf", -1.0), x.get("score", 0)),
+                        reverse=True):
             c = e.get("content", "")
             if c and c not in seen:
                 seen.add(c)

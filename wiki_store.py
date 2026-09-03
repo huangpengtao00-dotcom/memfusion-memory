@@ -283,6 +283,29 @@ def normalize_query(query: str) -> str:
     return q if q else query
 
 
+_FORGET_RE = re.compile(
+    r"(?:please\s+)?(?:forget|delete|remove|erase|scrub)\b[^.!?]{0,60}?"
+    r"(?:\bfrom\s+(?:your\s+)?memory\b|\bfrom\s+(?:your\s+)?records?\b)"
+    r"|(?:please\s+)?(?:forget|erase)\s+(?:about\s+)?(?:my|the|that)\b"
+    r"|\bdon'?t\s+(?:remember|keep|store|save)\b"
+    r"|\bstop\s+(?:remembering|keeping|storing)\b"
+    r"|忘掉|忘记|别再记|不要记住|删掉|删除",
+    re.IGNORECASE)
+
+
+def detect_forget_intent(text: str) -> bool:
+    """是否为遗忘指令。宁可漏判不可误判——误判会把正常记忆抑制掉。"""
+    return bool(text) and bool(_FORGET_RE.search(text))
+
+
+def forget_targets(text: str) -> set:
+    """遗忘指令指向的实词词干。指令本身的动词与记忆类名词不算目标。"""
+    drop = {"forget", "delet", "remov", "eras", "scrub", "memori", "memory", "record",
+            "rememb", "keep", "store", "save", "stop", "pleas", "my", "the", "that",
+            "from", "your", "don", "about", "it", "thi"}
+    return {t for t in _bm25_tokenize(text) if t not in drop and len(t) > 2}
+
+
 def _bm25_tokenize(text: str) -> List[str]:
     """中英文混合词项（带频率）：英文词（去停用词+单数化）+ 中文 2-gram。
 
@@ -357,6 +380,9 @@ class WikiStore:
         # 线程锁：FastAPI 多线程并发 Add/Search，写操作需要保护
         self._lock = __import__("threading").RLock()
         self._order_seq: Dict[tuple, int] = {}
+        # user -> [{"terms": set, "at": ms, "text": str}]。只标记不删数据:
+        # 协议没有 Delete 端点,而"用户要求忘掉"必须表现为之后检索不到旧值。
+        self._suppressed: Dict[str, List[Dict]] = {}
         # BM25 索引缓存：user_id -> (write_ver, BM25Index)。ingest 后失效重建。
         self._bm25_cache: Dict[str, tuple] = {}
         self._bm25_ver: Dict[str, int] = {}  # user_id -> 写入版本
@@ -525,6 +551,17 @@ class WikiStore:
                 content = annotate_relative_times(content, ref_date=ref)
             except Exception:
                 pass
+
+            # 遗忘指令登记。指令本身照常入库(它是可审计的记录),
+            # 但它指向的旧值在检索侧被挡住。
+            if self.search_cfg.get("suppression", True) and detect_forget_intent(content):
+                tg = forget_targets(content)
+                if tg:
+                    self._suppressed.setdefault(user_id, []).append({
+                        "terms": tg,
+                        "at": msg.get("timestamp") or 0,
+                        "text": content,
+                    })
 
             # 否定/修正检测（Fable5：personamem 偏好更新关键）
             is_negation = self._is_negation(content)
@@ -722,7 +759,14 @@ class WikiStore:
         use_emb = bool(cfg.get("use_emb", True))
         if docs and use_emb:
             from embedder import get_embedder
-            sims = get_embedder().search(normalize_query(query), docs, top_k=top_k)
+            q_for_emb = normalize_query(query)
+            # bge-* 的非对称检索前缀。默认关:两个公开数据族上实测方向相反且量级都很小
+            # (LoCoMo −0.62 / LongMemEval +0.76),而官方套件的 request_id 示例明确含
+            # locomo_refined。剥题面样板之后它原有的大部分收益已经被吃掉了。
+            prefix = cfg.get("bge_query_prefix")
+            if prefix:
+                q_for_emb = prefix + q_for_emb
+            sims = get_embedder().search(q_for_emb, docs, top_k=top_k)
             # 全部相似度为 0 = embedding 不可用/失败 → 跳过语义腿（避免 0 分噪音 rank）
             if max(sims) > 0:
                 emb_sim = {docs[i]: sims[i] for i in range(len(docs))}
@@ -744,15 +788,27 @@ class WikiStore:
             rrf[c] = s
 
         # 5. 按 RRF 排序，取 top_k；只保留至少命中一腿的（RRF>0）
+        # 排序键固定为 RRF;score 字段另有含义(绝对相关度),不能拿它排序
         sorted_content = sorted(rrf, key=rrf.get, reverse=True)
         results = [mem_map[c] for c in sorted_content[:top_k]]
         results = [r for r in results if rrf.get(r["content"], 0) > 0]
 
-        # 6. 证据 score（explore._dedup 按它排序 → 决定 answer 模型看到的 top 顺序）
-        for r in results:
+        # 6. 证据 score。排序继续用 RRF(名次融合对排序是对的),但 score 字段给绝对相关度。
+        #    纯 RRF 名次倒数没有动态范围:完美命中 1/61 vs 零重叠 1/62,差 6%。
+        #    任何"这批召回到底相不相关"的阈值判断(拒答、抑制、兜底)都建不起来。
+        #    饱和归一让 BM25 原始分落到 [0,1),再与余弦加权——两者都有绝对含义。
+        bm_k = float(cfg.get("bm25_sat", 8.0))
+        w_rel_kw = float(cfg.get("rel_w_kw", 0.6))
+        for i, r in enumerate(results):
             c = r["content"]
+            r["rrf"] = round(rrf.get(c, 0.0), 6)
+            r["rank"] = i + 1
             if score_mode == "rrf":
-                r["score"] = round(rrf.get(c, 0.0), 6)
+                bm = float(kw_score_map.get(c, 0.0))
+                lex = bm / (bm + bm_k) if bm > 0 else 0.0
+                cos = float(emb_sim.get(c, 0.0))
+                cos = cos if cos > 0 else 0.0
+                r["score"] = round(min(1.0, w_rel_kw * lex + (1.0 - w_rel_kw) * cos), 6)
             elif score_mode == "kw":
                 r["score"] = round(kw_score_map.get(c, 0.0), 4)
             # score_mode == "emb" → 保持 embedding 余弦（已在第 3 步设置）
@@ -763,10 +819,53 @@ class WikiStore:
         if budget > 0 and len(results) > top_k - budget:
             results = results[:top_k - budget]
         results = self._expand_neighbors(user_id, results, window=2, max_extra=budget or 10)
+        # 抑制必须是最后一道:邻居扩展不认抑制表,放在它之前会被重新补回来。
+        results = self._apply_suppression(user_id, results)
         # count 聚簇提示由 api.py 的 LLM 实体提取(build_count_hint)负责，这里不重复
         # 注意：近重复去重(_dedup_similar) 未验证出提升，暂不启用（避免未验证改动）
         # 原 _cluster_count_hint(词频聚簇) 已删除：死代码 + "theme:msg_count" 形态接近违规
         return results[:top_k]
+
+    def _apply_suppression(self, user_id: str, results: List[Dict]) -> List[Dict]:
+        """挡掉被用户要求忘掉的旧值,并保留一条可审计的抑制记录。
+
+        只挡时间早于该指令的条目——之后又说过的同一件事是新事实,不受影响。
+        判据是词干覆盖率:指令的实词有足够比例出现在候选里才算命中,
+        避免一句"删掉我的手机号"把整段对话抑制掉。
+        """
+        subs = self._suppressed.get(user_id)
+        if not subs or not results:
+            return results
+        thresh = float(self.search_cfg.get("suppression_cover", 0.6))
+        kept, blocked = [], []
+        for r in results:
+            terms = set(_bm25_tokenize(r.get("content", "")))
+            ts = r.get("temporal") or 0
+            hit = None
+            for sub in subs:
+                if r.get("content") == sub["text"]:
+                    break               # 指令自身不抑制自己
+                if sub["at"] and ts and ts > sub["at"]:
+                    continue            # 晚于指令 = 新事实
+                cover = len(sub["terms"] & terms) / max(1, len(sub["terms"]))
+                if cover >= thresh:
+                    hit = sub
+                    break
+            if hit is None:
+                kept.append(r)
+            else:
+                blocked.append(hit)
+        if blocked and not any(r.get("id") == "suppressed" for r in kept):
+            kept.append({
+                "id": "suppressed",
+                "content": (f"[suppressed] the user asked to forget this: "
+                            f"{blocked[0]['text'][:120]}"),
+                "score": 0.0, "rrf": 0.0,
+                "page_title": "", "dimension": "", "source": "",
+                "temporal": blocked[0]["at"] or None,
+                "confidence": 1.0, "polarity": "positive",
+            })
+        return kept
 
     def _expand_neighbors(self, user_id: str, results: List[Dict],
                           window: int = 2, max_extra: int = 10) -> List[Dict]:
@@ -803,13 +902,17 @@ class WikiStore:
         # v2.7：邻居消息分必须低于所有真实命中，否则 explore._dedup 按 score 降序
         # 重排时邻居挤到 top（full_input 500 条下 RRF 分 ~0.016 < 0.3），把答案消息
         # 挤出 top-10 → 时序/count 题 INSUFFICIENT。取命中最低分做地板，保证邻居殿后。
+        # 邻居分取最低命中分的一个固定比例,不是"减 0.001"。绝对差在任何量纲下都
+        # 近似于零惩罚,于是 10 条上下文以等同真命中的分数混进结果——话题提过但
+        # 细节从未说过的问题因此拿到几十条噪音,而那正是拒答题的标准构造。
+        ratio = float(self.search_cfg.get("neighbor_score_ratio", 0.3))
         floor = 0.0
         if results:
             try:
-                floor = min(float(r.get("score", 0) or 0) for r in results) - 0.001
+                floor = min(float(r.get("score", 0) or 0) for r in results) * ratio
             except Exception:
                 floor = 0.0
-        floor = max(floor, 0.0)  # 不为负
+        floor = max(floor, 0.0)
         for src, orders in by_source.items():
             orders_list = sorted(orders)
             for (order, content, page_id, source) in orders_list:
@@ -822,6 +925,7 @@ class WikiStore:
                         if content not in seen and len(extra) < max_extra:
                             extra.append({
                                 "id": page_id, "content": content, "score": floor,
+                                "rrf": 0.0, "neighbor": True,
                                 "source": source, "order": order,
                                 "page_title": "", "dimension": "",
                             })
