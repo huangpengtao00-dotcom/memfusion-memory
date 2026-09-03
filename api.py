@@ -76,29 +76,30 @@ def add(req: AddRequest):
 
 
 def format_evidence(r: dict) -> str:
-    """
-    给证据加元数据头（评分红利：让 answer 模型免猜来源/时间/人物）。
-    保留原文，只加简短确定性前缀。元数据缺失则只返回原文。
+    """给证据加 speaker + 日期前缀。答案模型只能看到 content,元数据不进它视野就等于不存在。
+
+    speaker 是必需的:E 类题问"用户偏好什么",而 role 缺失时用户自述与助手推荐无法区分。
+    日期给到日粒度——判官对粒度严格,秒级 ISO 会诱导答案过度具体化。
+    不输出 session_id(对答案模型无意义,纯 token),不输出 polarity(词表误判率高,
+    且官方答题提示词里没有这个标签的语义)。
     """
     content = r.get("content", "")
-    parts = []
-    src = r.get("source", "")
+    role = (r.get("role") or "").strip()
     ts = r.get("temporal")
-    polarity = r.get("polarity", "positive")
-    if src:
-        parts.append(f"[source: {src}]")
+    day = ""
     if ts:
         import datetime
         try:
-            dt = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc).isoformat()
-            parts.append(f"[date: {dt}]")
+            day = datetime.datetime.fromtimestamp(
+                ts / 1000, tz=datetime.timezone.utc).date().isoformat()
         except Exception:
-            pass
-    # 极性标记（Fable5：否定是当前有效事实，不是低置信/已失效）
-    if polarity == "negative":
-        parts.append("[polarity: negative]")
-    if parts:
-        return " ".join(parts) + "\n" + content
+            day = ""
+    if role and day:
+        return f"[{role} | {day}] {content}"
+    if role:
+        return f"[{role}] {content}"
+    if day:
+        return f"[{day}] {content}"
     return content
 
 
@@ -107,7 +108,7 @@ def search(req: SearchRequest):
     """explore agent 在 wiki 里探索，返回相关证据。只返回证据不生成答案。
     证据 content 带元数据头（source/date），让 answer 模型更容易正确引用。
     用同步 def（FastAPI 自动线程池），避免 async + 阻塞阻塞事件循环。"""
-    results = explorer.explore(req.user_id, req.query, top_k=req.top_k)
+    results = explorer.explore(req.user_id, req.query, top_k=req.top_k, options=req.options)
     # count 类 query：LLM 实体聚簇提示（让 answer 模型能数对），失败降级词法
     try:
         results = build_count_hint(

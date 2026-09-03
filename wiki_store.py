@@ -99,32 +99,187 @@ _BM25_RE_HAN = re.compile(r"[一-鿿]+")
 _BM25_RE_WORD = re.compile(r"[a-z0-9]+")
 
 
-def _singular_form(word: str) -> str:
-    """保守英文单数化（规则复数 → 单数，供 BM25 词形归一）。
+def _porter_stem(word: str) -> str:
+    """Porter (1980) 词干化。索引与 query 两侧必须用同一个函数,否则词形归一失效。
 
-    full_input(500 条)下最大召回杀手是 query 复数 vs 消息单数：
-    "tanks"匹配不到"tank"、"festivals"匹配不到"festival" → BM25 分数 0，
-    答案消息排不进 top-k。这里把英文词规约到单数（tank/tanks → tank），
-    索引与 query 两侧同时归一，单复数即等价。
+    不规则形先映射到原形再跑算法——只映射不跑算法会让 paid->pay 而 pay->pai,两者仍不等价。
 
-    只处理规则复数，保护以 -ss/-us/-is/-as/-os 结尾的固有单数（bus/class/
-    this/analysis/gas 等），避免过度剥离。
+    只做复数剥离时,pay/paid、buy/bought、own/owned、recommend/recommended 全部不等价,
+    含答案的唯一陈述会被"重复提及但不含答案"的闲聊按词频压到末位。
+    不规则动词(go/went)不在算法覆盖内,由 _IRREGULAR 兜。
     """
-    if len(word) <= 3:
-        return word
-    if word.endswith("ies") and len(word) > 4:
-        return word[:-3] + "y"                  # babies -> baby, movies 不命中
-    if word.endswith("sses"):
-        return word[:-2]                        # classes -> class
-    if word.endswith(("xes", "ches", "shes", "zes")) and len(word) > 4:
-        return word[:-2]                        # boxes -> box, watches -> watch
-    if word.endswith("ses") and len(word) > 4:
-        return word[:-1]                        # houses -> house, cases -> case
-    if word.endswith("es") and len(word) > 3:
-        return word[:-2]                        # 其他 -es（goes -> go）
-    if word.endswith("s") and not word.endswith(("ss", "us", "is", "as", "os")):
-        return word[:-1]                        # tanks -> tank, hours -> hour
-    return word
+    w = _IRREGULAR.get(word, word)
+    if len(w) <= 2:
+        return w
+
+    def is_cons(s: str, i: int) -> bool:
+        c = s[i]
+        if c in "aeiou":
+            return False
+        if c == "y":
+            return i == 0 or not is_cons(s, i - 1)
+        return True
+
+    def measure(stem: str) -> int:
+        n, prev_cons = 0, True
+        for i in range(len(stem)):
+            c = is_cons(stem, i)
+            if prev_cons and not c:
+                prev_cons = False
+            elif not prev_cons and c:
+                n += 1
+                prev_cons = True
+        return n
+
+    def has_vowel(stem: str) -> bool:
+        return any(not is_cons(stem, i) for i in range(len(stem)))
+
+    def double_cons_end(stem: str) -> bool:
+        return (len(stem) >= 2 and stem[-1] == stem[-2] and is_cons(stem, len(stem) - 1))
+
+    def cvc_end(stem: str) -> bool:
+        if len(stem) < 3:
+            return False
+        return (is_cons(stem, len(stem) - 1) and not is_cons(stem, len(stem) - 2)
+                and is_cons(stem, len(stem) - 3) and stem[-1] not in "wxy")
+
+    # Step 1a
+    if w.endswith("sses"):
+        w = w[:-2]
+    elif w.endswith("ies"):
+        w = w[:-2]
+    elif w.endswith("ss"):
+        pass
+    elif w.endswith("s"):
+        w = w[:-1]
+
+    # Step 1b
+    step1b_extra = False
+    if w.endswith("eed"):
+        if measure(w[:-3]) > 0:
+            w = w[:-1]
+    elif w.endswith("ed"):
+        if has_vowel(w[:-2]):
+            w = w[:-2]
+            step1b_extra = True
+    elif w.endswith("ing"):
+        if has_vowel(w[:-3]):
+            w = w[:-3]
+            step1b_extra = True
+    if step1b_extra:
+        if w.endswith(("at", "bl", "iz")):
+            w += "e"
+        elif double_cons_end(w) and w[-1] not in "lsz":
+            w = w[:-1]
+        elif measure(w) == 1 and cvc_end(w):
+            w += "e"
+
+    # Step 1c
+    if w.endswith("y") and has_vowel(w[:-1]):
+        w = w[:-1] + "i"
+
+    # Step 2
+    for suf, rep in (("ational", "ate"), ("tional", "tion"), ("enci", "ence"),
+                     ("anci", "ance"), ("izer", "ize"), ("abli", "able"),
+                     ("alli", "al"), ("entli", "ent"), ("eli", "e"), ("ousli", "ous"),
+                     ("ization", "ize"), ("ation", "ate"), ("ator", "ate"),
+                     ("alism", "al"), ("iveness", "ive"), ("fulness", "ful"),
+                     ("ousness", "ous"), ("aliti", "al"), ("iviti", "ive"),
+                     ("biliti", "ble")):
+        if w.endswith(suf):
+            if measure(w[:-len(suf)]) > 0:
+                w = w[:-len(suf)] + rep
+            break
+
+    # Step 3
+    for suf, rep in (("icate", "ic"), ("ative", ""), ("alize", "al"), ("iciti", "ic"),
+                     ("ical", "ic"), ("ful", ""), ("ness", "")):
+        if w.endswith(suf):
+            if measure(w[:-len(suf)]) > 0:
+                w = w[:-len(suf)] + rep
+            break
+
+    # Step 4
+    for suf in ("al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement",
+                "ment", "ent", "ou", "ism", "ate", "iti", "ous", "ive", "ize"):
+        if w.endswith(suf):
+            stem = w[:-len(suf)]
+            if suf == "ion":
+                if measure(stem) > 1 and stem and stem[-1] in "st":
+                    w = stem
+            elif measure(stem) > 1:
+                w = stem
+            break
+    else:
+        if w.endswith("ion"):
+            stem = w[:-3]
+            if measure(stem) > 1 and stem and stem[-1] in "st":
+                w = stem
+
+    # Step 5a
+    if w.endswith("e"):
+        stem = w[:-1]
+        if measure(stem) > 1 or (measure(stem) == 1 and not cvc_end(stem)):
+            w = stem
+
+    # Step 5b
+    if measure(w) > 1 and double_cons_end(w) and w.endswith("l"):
+        w = w[:-1]
+
+    return w
+
+
+_IRREGULAR = {
+    "went": "go", "gone": "go", "goes": "go", "going": "go",
+    "paid": "pay", "pays": "pay", "paying": "pay",
+    "bought": "buy", "buys": "buy", "buying": "buy",
+    "spent": "spend", "spends": "spend", "spending": "spend",
+    "taught": "teach", "teaches": "teach", "teaching": "teach",
+    "caught": "catch", "thought": "think", "brought": "bring",
+    "sought": "seek", "told": "tell", "sold": "sell", "held": "hold",
+    "made": "make", "took": "take", "taken": "take", "got": "get",
+    "gotten": "get", "gave": "give", "given": "give", "came": "come",
+    "saw": "see", "seen": "see", "ate": "eat", "eaten": "eat",
+    "drove": "drive", "driven": "drive", "wrote": "write", "written": "write",
+    "ran": "run", "won": "win", "lost": "lose", "left": "leave",
+    "felt": "feel", "kept": "keep", "slept": "sleep", "met": "meet",
+    "read": "read", "said": "say", "says": "say", "heard": "hear",
+    "children": "child", "feet": "foot", "teeth": "tooth", "men": "man",
+    "women": "woman", "people": "person", "mice": "mouse", "geese": "goose",
+    "better": "good", "best": "good", "worse": "bad", "worst": "bad",
+    "was": "be", "were": "be", "been": "be", "am": "be", "are": "be", "is": "be",
+    "had": "have", "has": "have", "having": "have", "did": "do", "does": "do",
+    "done": "do", "doing": "do",
+}
+
+
+def _singular_form(word: str) -> str:
+    """保留名以兼容既有调用点;实现已换成 Porter 词干化。"""
+    return _porter_stem(word)
+
+
+_QUERY_BOILERPLATE = re.compile(
+    r"(?:now\s+is\s+[\d/\-\.]+\s*(?:\([a-z]{3}\))?\s*[\d:]*|"
+    r"please\s+answer\s+the\s+question\s*:?|"
+    r"answer\s+the\s+following\s+question\s*:?|"
+    r"based\s+on\s+(?:the\s+)?(?:above|following)\s+\w+\s*:?)",
+    re.IGNORECASE)
+_BARE_DATE_TOKEN = re.compile(r"\b\d{1,4}[/\-\.]\d{1,2}(?:[/\-\.]\d{1,4})?\b|\b\d{4}\b|\b\d{1,2}:\d{2}\b")
+
+
+def normalize_query(query: str) -> str:
+    """剥掉题面样板与裸日期 token。两条腿都吃这个结果。
+
+    评测题面形如 "Now is 2023/05/30 (Tue) 22:53.\n Please answer the question: ..."。
+    样板词会进 BM25 词项去命中一切含这些数字的消息,也会稀释 query embedding 的语义。
+    只剥样板,不改语义词——剥不掉就原样返回,不做静默兜底。
+    """
+    if not query:
+        return query
+    q = _QUERY_BOILERPLATE.sub(" ", query)
+    q = _BARE_DATE_TOKEN.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip(" .:\n")
+    return q if q else query
 
 
 def _bm25_tokenize(text: str) -> List[str]:
@@ -200,6 +355,7 @@ class WikiStore:
         self.user_meta: Dict[str, Dict] = {}
         # 线程锁：FastAPI 多线程并发 Add/Search，写操作需要保护
         self._lock = __import__("threading").RLock()
+        self._order_seq: Dict[tuple, int] = {}
         # BM25 索引缓存：user_id -> (write_ver, BM25Index)。ingest 后失效重建。
         self._bm25_cache: Dict[str, tuple] = {}
         self._bm25_ver: Dict[str, int] = {}  # user_id -> 写入版本
@@ -287,6 +443,14 @@ class WikiStore:
         with self._lock:
             return self._ingest_unlocked(user_id, messages, writer, session_id)
 
+    def _next_order(self, user_id: str, source: str, count: int) -> int:
+        """给 (user, source) 分配连续 order 段。平台按块多次 Add,同 session 各块的
+        msg_idx 都从 0 重数 → (source, order) 键冲突,邻居窗口会把不相邻的消息当邻居。"""
+        key = (user_id, source or "")
+        base = self._order_seq.get(key, 0)
+        self._order_seq[key] = base + max(0, count)
+        return base
+
     def _ingest_unlocked(self, user_id: str, messages: List[Dict], writer=None,
                          session_id: Optional[str] = None) -> int:
         """加锁内的实际写入逻辑。"""
@@ -333,7 +497,10 @@ class WikiStore:
         except Exception:
             pass
 
+        _order_base = self._next_order(
+            user_id, session_id or f"{user_id}:batch", len(messages))
         for msg_idx, msg in enumerate(messages):
+            msg_idx = _order_base + msg_idx
             content = msg.get("content", "")
             if not content:
                 continue
@@ -436,14 +603,20 @@ class WikiStore:
 
     # ---- 简单检索（后续 explore agent 用）----
     def _collect_sections(self, user_id: str) -> List[tuple]:
-        """收集 (dim, page, section)，保证与 BM25 索引的 docs 顺序一致。"""
-        dims = self._ensure_user(user_id)
-        sections: List[tuple] = []
-        for dim in dims.values():
-            for page in dim.pages.values():
-                for section in page.sections.values():
-                    sections.append((dim, page, section))
-        return sections
+        """收集 (dim, page, section)，保证与 BM25 索引的 docs 顺序一致。
+
+        必须在锁内快照:并发 Add 会在遍历途中改写同一批 dict,
+        裸遍历会抛 dictionary changed size during iteration,而上层裸 except
+        把它变成 HTTP 200 + 空数组——故障被伪装成"该用户没有相关记忆"。
+        """
+        with self._lock:
+            dims = self._ensure_user(user_id)
+            sections: List[tuple] = []
+            for dim in list(dims.values()):
+                for page in list(dim.pages.values()):
+                    for section in list(page.sections.values()):
+                        sections.append((dim, page, section))
+            return sections
 
     def _get_bm25(self, user_id: str, sections: List[tuple]) -> BM25Index:
         """按 user 取 BM25 索引（带写入版本缓存）。"""
@@ -519,15 +692,20 @@ class WikiStore:
                 "speaker": sec.facts[0] if sec.facts else "",  # speaker 占位
             }
 
-        # 2. BM25 全量 rank（不只 top_k，让 RRF 能看到全部命中文档）
+        # 融合准入:两腿都只让候选窗口内的文档进 RRF。
+        # 稠密腿若给全库 N 篇都排名,rrf>0 等于不过滤——真命中得 1/61、零词法命中的文档得
+        # 1/62,分差 1.6%,近零 IDF query 下退化成"按写入顺序返回前 top_k 条"。
+        cand = int(cfg.get("cand_k", max(200, top_k * 2)))
+
+        # 2. BM25 rank（只排命中文档，且截到候选窗口）
         index = self._get_bm25(user_id, sections)
-        qterms = _bm25_tokenize(query)
+        qterms = _bm25_tokenize(normalize_query(query))
         kw_scores = index.scores(qterms)
         kw_score_map = {docs[i]: kw_scores[i] for i in range(len(docs))}
         kw_rank = {}
         order = sorted(range(len(docs)), key=lambda i: -kw_scores[i])
         for rank, i in enumerate(order):
-            if kw_scores[i] <= 0:
+            if kw_scores[i] <= 0 or rank >= cand:
                 break
             kw_rank[docs[i]] = rank + 1
 
@@ -538,12 +716,14 @@ class WikiStore:
         use_emb = bool(cfg.get("use_emb", True))
         if docs and use_emb:
             from embedder import get_embedder
-            sims = get_embedder().search(query, docs, top_k=top_k)
+            sims = get_embedder().search(normalize_query(query), docs, top_k=top_k)
             # 全部相似度为 0 = embedding 不可用/失败 → 跳过语义腿（避免 0 分噪音 rank）
             if max(sims) > 0:
                 emb_sim = {docs[i]: sims[i] for i in range(len(docs))}
                 eorder = sorted(range(len(docs)), key=lambda i: -sims[i])
                 for rank, i in enumerate(eorder):
+                    if rank >= cand or sims[i] <= 0:
+                        break
                     emb_rank[docs[i]] = rank + 1
                     mem_map[docs[i]]["score"] = round(float(sims[i]), 4)
 
@@ -571,8 +751,12 @@ class WikiStore:
                 r["score"] = round(kw_score_map.get(c, 0.0), 4)
             # score_mode == "emb" → 保持 embedding 余弦（已在第 3 步设置）
 
-        # 滑动窗口扩展：命中消息的相邻消息也补召回（对话连续性，locomo/scriptmem 事件簇）
-        results = self._expand_neighbors(user_id, results, window=2, max_extra=10)
+        # 邻居预算:先给邻居留席位再扩展。截断放在扩展之后会让命中数 >= top_k 时
+        # extra 全被丢掉,而那正是最需要上下文的长语料。
+        budget = min(int(cfg.get("neighbor_budget", 10)), max(0, top_k // 5))
+        if budget > 0 and len(results) > top_k - budget:
+            results = results[:top_k - budget]
+        results = self._expand_neighbors(user_id, results, window=2, max_extra=budget or 10)
         # count 聚簇提示由 api.py 的 LLM 实体提取(build_count_hint)负责，这里不重复
         # 注意：近重复去重(_dedup_similar) 未验证出提升，暂不启用（避免未验证改动）
         # 原 _cluster_count_hint(词频聚簇) 已删除：死代码 + "theme:msg_count" 形态接近违规
@@ -589,13 +773,14 @@ class WikiStore:
         # 构建 (source, order) -> section 索引（按对话分组）
         from collections import defaultdict
         by_source = defaultdict(list)  # source -> [(order, content, page_id)]
-        dims = self._ensure_user(user_id)
-        for dim in dims.values():
-            for page in dim.pages.values():
-                for section in page.sections.values():
-                    if section.source:
-                        by_source[section.source].append(
-                            (section.order, section.content, page.id, section.source))
+        with self._lock:
+            dims = self._ensure_user(user_id)
+            for dim in list(dims.values()):
+                for page in list(dim.pages.values()):
+                    for section in list(page.sections.values()):
+                        if section.source:
+                            by_source[section.source].append(
+                                (section.order, section.content, page.id, section.source))
 
         # 对每个 source 按 order 排序
         for src in by_source:
@@ -669,10 +854,15 @@ class WikiStore:
 
     @staticmethod
     def _is_negation(text: str) -> bool:
-        """否定/修正表达检测（personamem 偏好更新关键）。"""
+        """只认显式的偏好改写措辞。
+
+        原词表含 "actually" / "instead" / "not ",真实语料抽样误判率极高
+        ("I actually finished the marathon" / "not just a hobby" 都被判否定),
+        而 polarity 已不再上送给答案模型,这里只保留写入侧的强信号。
+        """
         t = text.lower()
-        neg = ["不再喜欢", "不喜欢", "no longer", "actually", "instead",
-               "changed my mind", "改为", "改成", "其实", "not "]
+        neg = ["不再喜欢", "no longer", "changed my mind", "used to but",
+               "改为", "改成", "不再是"]
         return any(n in t for n in neg)
 
     @staticmethod

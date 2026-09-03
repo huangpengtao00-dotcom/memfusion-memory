@@ -260,10 +260,12 @@ class ExploreAgent:
         return "DONE"
 
     # ---- 主入口 ----
-    def explore(self, user_id: str, query: str, top_k: Optional[int] = None) -> List[Dict]:
+    def explore(self, user_id: str, query: str, top_k: Optional[int] = None,
+                options: Optional[List[str]] = None) -> List[Dict]:
         """
         在 wiki 里探索，返回相关证据（只返回证据，不生成答案）。
         top_k：召回宽度（默认 None→题型感知）。评测平台传 100 时填满到 top_k。
+        options：选择题选项。各自作为一个 query 视角检索后并入,只允许向上抬分。
         """
         tools = self._tools(user_id)
         state: Dict = {}
@@ -311,6 +313,18 @@ class ExploreAgent:
             if expanded and expanded != query:
                 seed_exp = tools["keyword_search"](expanded, recall_k)
                 seed = self._rrf_merge(seed, seed_exp, k=60)
+            # 选项各作一个 query 视角:正确选项的文本本身是最强召回信号。
+            # 只做并集式融合,不替换原 query 的排名。
+            for opt in (options or [])[:8]:
+                opt = (opt or "").strip()
+                if len(opt) < 2:
+                    continue
+                try:
+                    seed_opt = tools["keyword_search"](f"{query} {opt}", recall_k)
+                    if seed_opt:
+                        seed = self._rrf_merge(seed, seed_opt, k=60)
+                except Exception:
+                    continue
             if not seed and expanded != query:
                 seed = tools["keyword_search"](query, recall_k)  # 扩展没召回 → 原 query
             if seed:
@@ -405,7 +419,30 @@ class ExploreAgent:
         except Exception as e:
             import traceback as _tb
             self.last_diag = {"error": True, "err": str(e)[:200], "tb": _tb.format_exc()[-500:]}
-            return self._dedup(state.get("evidence", []))
+            salvaged = self._dedup(state.get("evidence", []))
+            if salvaged:
+                return salvaged
+            # 空数组会被判成"这个用户没有相关记忆",而真相是检索炸了。
+            # 宁可给最近若干条让答案模型自己判断,也不要把故障伪装成空结果。
+            return self._recent_fallback(user_id, top_k or 20)
+
+    def _recent_fallback(self, user_id: str, limit: int) -> List[Dict]:
+        """检索失败时的下限:该用户最近若干条。返回空数组等于谎报"无此记忆"。"""
+        try:
+            sections = self.store._collect_sections(user_id)
+        except Exception:
+            return []
+        rows = []
+        for _d, page, sec in sections:
+            rows.append({
+                "id": page.id, "content": sec.content, "score": 0.0,
+                "page_title": page.title, "dimension": _d.name,
+                "source": sec.source, "role": sec.role, "temporal": sec.temporal,
+                "confidence": sec.confidence, "polarity": sec.polarity,
+                "order": sec.order,
+            })
+        rows.sort(key=lambda r: (r.get("temporal") or 0, r.get("order") or 0), reverse=True)
+        return rows[:max(1, limit)]
 
     @staticmethod
     def _build_age_hint(query: str, results: List[Dict]) -> Optional[str]:

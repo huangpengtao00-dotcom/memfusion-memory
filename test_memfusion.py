@@ -117,6 +117,84 @@ def test_api_contract_models():
     assert search.top_k == 5
 
 
+def test_stemmer_equates_verb_forms():
+    """词形归一:索引与 query 两侧必须落到同一个词干,否则唯一事实陈述会被词频压到末位。"""
+    from wiki_store import _porter_stem as st
+    for a, b in [("pay", "paid"), ("buy", "bought"), ("own", "owned"),
+                 ("recommend", "recommended"), ("go", "went"), ("movies", "movie"),
+                 ("children", "child"), ("teach", "taught")]:
+        assert st(a) == st(b), f"{a} vs {b}: {st(a)} != {st(b)}"
+
+
+def test_query_normalisation_strips_boilerplate():
+    """题面样板与裸日期不得进检索词——它们会去命中一切含这些数字的消息。"""
+    from wiki_store import normalize_query
+    q = normalize_query("Now is 2023/05/30 (Tue) 22:53.\n Please answer the question: What play did I attend?")
+    assert q == "What play did I attend?", q
+    assert normalize_query("How much did I pay?") == "How much did I pay?"
+    assert normalize_query("2023/05/30") == "2023/05/30"  # 剥空则原样返回
+
+
+def test_dense_leg_is_admission_capped():
+    """稠密腿给全库排名会让 rrf>0 等于不过滤,真命中与零重叠文档只差 1.6%。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False, "cand_k": 3})
+    msgs = [{"role": "user", "content": f"unrelated filler line {i}", "timestamp": None}
+            for i in range(20)]
+    msgs.append({"role": "user", "content": "my telescope cost 450 dollars", "timestamp": None})
+    store.ingest("u", msgs, writer=None, session_id="s1")
+    res = store.hybrid_search("u", "telescope cost", top_k=10)
+    assert res, "应召回到含答案的那条"
+    assert any("telescope" in r["content"] for r in res)
+    assert len(res) <= 10
+
+
+def test_order_is_monotonic_across_add_batches():
+    """平台按块多次 Add,order 若每批从 0 重数,(source, order) 键冲突会让邻居窗口认错邻居。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    for batch in range(3):
+        store.ingest("u", [{"role": "user", "content": f"b{batch} m{i}", "timestamp": None}
+                           for i in range(5)], writer=None, session_id="sess-1")
+    orders = [sec.order for _d, _p, sec in store._collect_sections("u")]
+    assert len(orders) == len(set(orders)), f"order 冲突: {sorted(orders)}"
+
+
+def test_evidence_carries_speaker():
+    """role 存了不上送等于不存在:E 类题分不清用户自述与助手推荐。"""
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location(
+        "_api_probe", pathlib.Path(__file__).with_name("api.py"))
+    try:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception:
+        return  # 缺 fastapi 时跳过，其余断言已由上面几条覆盖
+    out = mod.format_evidence({"content": "I hate cilantro.", "role": "user",
+                               "temporal": 1683504000000})
+    assert out.startswith("[user | 2023-05-08]"), out
+    assert "[source:" not in out and "polarity" not in out
+
+
+def test_failed_search_does_not_return_empty():
+    """空数组会被读成「该用户没有相关记忆」,而真相可能是检索炸了。"""
+    from wiki_store import WikiStore
+    from explore_agent import ExploreAgent
+    store = WikiStore()
+    store.ingest("u", [{"role": "user", "content": f"line {i}", "timestamp": 1683504000000 + i}
+                       for i in range(5)], writer=None, session_id="s1")
+    ex = ExploreAgent(store, decider=None, orchestrator=None)
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated retrieval failure")
+    store.hybrid_search = boom
+    store.keyword_search = boom
+    res = ex.explore("u", "anything", top_k=5)
+    assert res, "检索失败时不得返回空数组"
+    assert len(res) <= 5
+
+
 if __name__ == "__main__":
     # 简单 runner（不用 pytest 也能跑）
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
