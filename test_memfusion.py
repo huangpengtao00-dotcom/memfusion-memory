@@ -195,6 +195,64 @@ def test_failed_search_does_not_return_empty():
     assert len(res) <= 5
 
 
+def test_no_today_fallback_in_normalisation():
+    """拿不到锚点必须原样返回。回落服务器当天会把旧对话改写成今天的日期并永久入库。"""
+    import datetime
+    from time_utils import normalize_relative_times, annotate_relative_times
+    src = "I adopted a puppy yesterday."
+    assert normalize_relative_times(src, None) == src
+    assert annotate_relative_times(src, None) == src
+    out = annotate_relative_times(src, datetime.date(2023, 5, 8))
+    assert "yesterday" in out, "原词必须留着——判官要求 gold 相对时答案也相对"
+    assert "2023-05-07" in out, out
+
+
+def test_timestamp_is_used_as_normalisation_anchor():
+    """平台下发的 timestamp 才是这条消息真实的事件时间,此前它从不用作归一化锚点。"""
+    from wiki_store import WikiStore
+    store = WikiStore()
+    ts = 1683504000000  # 2023-05-08 UTC
+    store.ingest("u", [{"role": "user", "content": "I adopted a puppy yesterday.",
+                        "timestamp": ts}], writer=None, session_id="s1")
+    texts = [sec.content for _d, _p, sec in store._collect_sections("u")]
+    joined = " ".join(texts)
+    assert "2023-05-07" in joined, joined
+    import datetime
+    assert str(datetime.date.today().year) not in joined or "2023" in joined
+
+
+def test_synthetic_evidence_never_injected_without_real_hits():
+    """零真命中时注入派生条目 = 把「记忆里没有」伪装成「有针对性证据」,拒答题正是这批。"""
+    from wiki_store import WikiStore
+    from explore_agent import ExploreAgent, _DERIVED_IDS
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    store.ingest("u", [{"role": "user", "content": "I went hiking in the Alps.",
+                        "timestamp": 1683504000000}], writer=None, session_id="s1")
+    store.set_user_meta("u", "current_date", "2023-06-01")
+    ex = ExploreAgent(store, decider=None, orchestrator=None)
+    res = ex.explore("u", "When did I renew my zzzqqq passport?", top_k=10)
+    assert not [r for r in res if r.get("id") in _DERIVED_IDS], \
+        f"零真命中却注入了派生条目: {[r.get('id') for r in res]}"
+
+
+def test_derived_evidence_ranks_below_real_evidence():
+    """派生条目原来 score=1.0、真证据 ~0.016,永远占第一条。"""
+    from wiki_store import WikiStore
+    from explore_agent import ExploreAgent, _DERIVED_IDS
+    store = WikiStore()
+    store.search_cfg.update({"use_emb": False})
+    store.ingest("u", [{"role": "user", "content": "I got my flu shot on the 3rd.",
+                        "timestamp": 1683504000000}], writer=None, session_id="s1")
+    store.set_user_meta("u", "current_date", "2023-06-01")
+    ex = ExploreAgent(store, decider=None, orchestrator=None)
+    res = ex.explore("u", "How many days ago did I get my flu shot?", top_k=10)
+    reals = [float(r.get("score") or 0) for r in res if r.get("id") not in _DERIVED_IDS]
+    derived = [float(r.get("score") or 0) for r in res if r.get("id") in _DERIVED_IDS]
+    if derived and reals:
+        assert max(derived) <= min(reals), f"派生 {derived} 不得高于真证据 {reals}"
+
+
 if __name__ == "__main__":
     # 简单 runner（不用 pytest 也能跑）
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

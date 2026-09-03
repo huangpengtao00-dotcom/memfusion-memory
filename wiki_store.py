@@ -16,6 +16,7 @@ import uuid
 import time
 import math
 import re
+import datetime
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Set
@@ -514,9 +515,14 @@ class WikiStore:
             # 多会话 focused 里第二/第三会话的 "today" 全被压平到第一个会话日期，
             # "between events" 题系统性算成 0 天。current_date 只做 as-of 锚点，不做归一化锚）
             try:
-                from time_utils import normalize_relative_times
+                from time_utils import annotate_relative_times
                 ref = msg.get("session_date") or session_date or current_date
-                content = normalize_relative_times(content, ref_date=ref)
+                if ref is None and msg.get("timestamp"):
+                    # 平台按协议下发的 timestamp 才是这条消息真实的事件时间;
+                    # 此前它只写进 Section.temporal,从不用作归一化锚点。
+                    ref = datetime.datetime.fromtimestamp(
+                        msg["timestamp"] / 1000, tz=datetime.timezone.utc).date()
+                content = annotate_relative_times(content, ref_date=ref)
             except Exception:
                 pass
 

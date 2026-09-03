@@ -12,12 +12,15 @@ from typing import Optional
 
 
 def normalize_relative_times(text: str, ref_date: Optional[datetime.date] = None) -> str:
+    """把相对时间词替换为绝对日期。**ref_date 为 None 时原样返回,绝不回落 today()。**
+
+    回落服务器当天会把 2023 年的对话正文改写成今天的日期并永久入库,答案模型于是在
+    同一条证据里看到两个互相矛盾的日期。拿不到锚点就什么都不做——宁可不归一化,
+    不可写入假日期。
     """
-    把 text 里的相对时间词替换为绝对日期（基于 ref_date）。
-    ref_date = 对话发生的日期（默认今天）。
-    示例：ref=2023/02/15 时，"yesterday" → "2023-02-14"。
-    """
-    ref = ref_date or datetime.date.today()
+    if ref_date is None:
+        return text
+    ref = ref_date
 
     def replace(m):
         w = m.group(0).lower()
@@ -57,6 +60,21 @@ def normalize_relative_times(text: str, ref_date: Optional[datetime.date] = None
                       }[m.group(2).lower()])),
                   text)
     return text
+
+
+def annotate_relative_times(text: str, ref_date: Optional[datetime.date] = None) -> str:
+    """保留原词,把解析结果追加在句尾。
+
+    判官明文禁止相对与绝对互转,且要求 gold 用相对表述时答案也必须是相对形式;
+    答题提示词还要求 week 级表述保持相对。直接替换原词会让答案模型物理上无法
+    产出相对形式,所以原词必须留在正文里,解析只能作为附注。
+    """
+    if ref_date is None or not text:
+        return text
+    resolved = normalize_relative_times(text, ref_date=ref_date)
+    if resolved == text:
+        return text
+    return f"{text} [resolved: {resolved}]"
 
 
 def _weekday_replace(m, ref: datetime.date) -> str:

@@ -109,10 +109,11 @@ The metric is EvidenceRecall — whether the annotated evidence message reaches 
 
 | | before | after | delta |
 |---|---|---|---|
-| EvidenceRecall@100 | 0.7946 | **0.8274** | +0.0329 |
-| EvidenceRecall@10 | 0.5270 | **0.5599** | +0.0329 |
-| questions with zero recall | 208 | **173** | −35 |
-| multi-hop category | 0.6260 | **0.7057** | +0.0797 |
+| EvidenceRecall@100 | 0.7946 | **0.8595** | +0.0649 |
+| EvidenceRecall@10 | 0.5270 | **0.5797** | +0.0527 |
+| questions with zero recall | 208 | **134** | −74 |
+| multi-hop category | 0.6260 | **0.7279** | +0.1019 |
+| temporal category | 0.7883 | **0.9013** | +0.1130 |
 
 What changed, all retrieval-side and with no added LLM calls:
 
@@ -132,6 +133,17 @@ What changed, all retrieval-side and with no added LLM calls:
 - **Reads are snapshotted under the lock**, and a failed Search no longer returns `{"data": []}`.
   Concurrent Add + Search used to raise mid-iteration and the bare `except` turned that into
   HTTP 200 with an empty array — a failure disguised as "this user has no such memory".
+- **Relative-time normalisation no longer falls back to the server's current date.** It used to
+  rewrite a 2023 conversation with today's date and store that, so one piece of evidence carried
+  two contradicting dates. The anchor now comes from the message's own `timestamp`, and with no
+  anchor available nothing is rewritten. The original wording is also kept and the resolution
+  appended, because a judge that forbids relative/absolute conversion cannot be satisfied by
+  text where the relative form has been deleted.
+- **Synthetic evidence has an admission gate**: nothing derived is injected when there are no
+  real hits, and derived items now rank below every real one. They used to score 1.0 against
+  ~0.016 for genuine evidence, so a question with nothing in memory still received a
+  confident-looking date anchor at the top of the list — exactly the shape that makes an answer
+  model stop abstaining and start inventing.
 
 ## Roadmap
 

@@ -136,6 +136,10 @@ class LLMDecider:
             return "DONE"  # LLM 不可用 → 结束（或降级启发式）
 
 
+# 派生条目的 id:它们不是记忆,不参与"有无真命中"的判断
+_DERIVED_IDS = {"as-of", "time-hint", "age-hint", "count-hint"}
+
+
 class ExploreAgent:
     """
     ExploreAgent：在 wiki 里主动探索，找到相关记忆证据。
@@ -368,18 +372,30 @@ class ExploreAgent:
             # Super Bowl 题因此算不出"17 days ago" → INSUFFICIENT）
             # v2.5c：只对**有时序意图**的问题上送 as-of（count/偏好/事实题带上 [as-of:] 是纯噪音，
             # 维度侧实测让 count 题 answer 数偏）。asof 变量仍保留给 time-hint 用。
+            # 合成证据准入闸:零真命中时一条都不注入,且分数压到所有真证据之下。
+            # 违反任一条都会把「记忆里没有」伪装成「有针对性的证据」,让答案模型
+            # 放弃拒答去编——而拒答题恰好就是零真命中的那批。
+            real_hits = [r for r in results if r.get("id") not in _DERIVED_IDS]
+            min_real = min((float(r.get("score") or 0.0) for r in real_hits), default=0.0)
+            derived_score = min_real * 0.5 if min_real > 0 else 0.0
+
+            def _derive(_id: str, text: str, append: bool = True):
+                """把派生条目挂到真证据之后。空 real_hits 时直接丢弃。"""
+                if not real_hits:
+                    return None
+                return {
+                    "id": _id, "content": f"[derived] {text}", "score": derived_score,
+                    "page_title": "", "dimension": "", "source": "",
+                    "temporal": None, "confidence": 1.0, "polarity": "positive",
+                }
+
             asof = None
             try:
                 asof = self.store.get_user_meta(user_id, "current_date")
                 if asof and self._has_temporal_intent(query):
-                    results = results + [{
-                        "id": "as-of",
-                        "content": f"[as-of: {asof}]",
-                        "score": 0.5,
-                        "page_title": "", "dimension": "",
-                        "source": "", "temporal": None,
-                        "confidence": 1.0, "polarity": "positive",
-                    }]
+                    item = _derive("as-of", f"as-of: {asof}")
+                    if item:
+                        results = results + [item]
             except Exception:
                 asof = None
             # v2.5b：answer 模型(qwen-plus)日期算术弱，即使有 [date:] 元数据，
@@ -391,13 +407,9 @@ class ExploreAgent:
                 hint = build_temporal_hint(query, results, asof)
                 if not hint:
                     hint = build_clock_hint(query, results)  # 机制3：钟表时间跨消息推断
-                if hint:
-                    results = [{
-                        "id": "time-hint", "content": hint, "score": 1.0,
-                        "page_title": "", "dimension": "",
-                        "source": "", "temporal": None,
-                        "confidence": 1.0, "polarity": "positive",
-                    }] + results
+                item = _derive("time-hint", hint) if hint else None
+                if item:
+                    results = results + [item]
             except Exception:
                 pass
             # v2.7：多跳年龄题 "How old was I when X was born?"——答案 = 用户年龄 - X 年龄。
@@ -406,13 +418,9 @@ class ExploreAgent:
             # 注入 [age-hint]（类似 time-hint，answer 只须照抄）。
             try:
                 age_hint = self._build_age_hint(query, results)
-                if age_hint:
-                    results = [{
-                        "id": "age-hint", "content": age_hint, "score": 1.0,
-                        "page_title": "", "dimension": "",
-                        "source": "", "temporal": None,
-                        "confidence": 1.0, "polarity": "positive",
-                    }] + results
+                item = _derive("age-hint", age_hint) if age_hint else None
+                if item:
+                    results = results + [item]
             except Exception:
                 pass
             return results
