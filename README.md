@@ -187,3 +187,7 @@ docker run -p 8083:8083 -e MEMFUSION_LLM_API_KEY=your_key memfusion-v2
 ```
 
 Endpoints: `POST /add`, `POST /search`, `GET /health`
+
+---
+
+More context: [opallagent.com/](https://opallagent.com/) — Notes on agent loops, evaluation evidence, and boundary statements.
